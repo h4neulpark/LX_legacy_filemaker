@@ -5,7 +5,7 @@ a = Analysis(
     ['app.py'],
     pathex=[],
     binaries=[],
-    datas=[('법정동코드 전체자료.txt', '.')],
+    datas=[('법정동코드 전체자료.txt', '.'), ('assets/ocr', 'assets/ocr')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

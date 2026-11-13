@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import datetime as dt
 import json
+import multiprocessing
 import os
 import re
 import shutil
@@ -17,6 +18,7 @@ from tooltips import Tooltip
 try:
     import pymupdf as fitz
     from pdf_region import AddressRegion, canvas_to_relative, extract_region_text, move_bounds, normalized_bounds
+    from ocr_engine import OcrJob, clean_ocr_address
 except ImportError:  # pragma: no cover - exercised only on machines missing the optional GUI dependency.
     fitz = None
 
@@ -416,6 +418,10 @@ class FileMakerApp(tk.Tk):
         self.shortcut_tag = f"FileMakerShortcuts{id(self)}"
         self.render_zoom = 1.0
         self.rendered_page_index = None
+        self.ocr_job = None
+        self.ocr_poll_id = None
+        self.ocr_context = None
+        self.last_ocr_text = ''
 
         self.code_file = tk.StringVar(value=str(DEFAULT_CODE_FILE))
         self.source_folder = tk.StringVar()
@@ -441,6 +447,7 @@ class FileMakerApp(tk.Tk):
 
         self._build_widgets(years)
         self._bind_events()
+        self.address_query.trace_add('write', self.on_address_query_edited)
         self._install_tooltips()
         if DEFAULT_CODE_FILE.exists():
             self.load_code_file(DEFAULT_CODE_FILE)
@@ -512,6 +519,7 @@ class FileMakerApp(tk.Tk):
         ttk.Button(region_bar, text="영역 읽기", command=self.read_address_region).pack(side=tk.LEFT, padx=(0, 4))
         ttk.Button(region_bar, text="영역 해제", command=self.clear_address_region).pack(side=tk.LEFT)
         ttk.Button(region_bar, text="키보드 편집 (Alt+5)", command=self.edit_region_keyboard).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Button(region_bar, text="OCR 읽기 (F8)", command=self.shortcut_force_ocr).pack(side=tk.LEFT, padx=(4, 0))
         ttk.Label(parent, textvariable=self.region_status, wraplength=500).grid(row=3, column=0, sticky=tk.W, pady=(0, 4))
 
         viewer = ttk.Frame(parent)
@@ -649,6 +657,7 @@ class FileMakerApp(tk.Tk):
             "<Alt-Key-4>": self.shortcut_focus_output_list,
             "<Alt-4>": self.shortcut_focus_output_list,
             "<F5>": self.shortcut_refresh_lists,
+            "<F8>": self.shortcut_force_ocr,
             "<Prior>": self.shortcut_previous_page,
             "<Next>": self.shortcut_next_page,
             "<Control-minus>": self.shortcut_zoom_out,
@@ -697,7 +706,8 @@ class FileMakerApp(tk.Tk):
             "폭 맞춤 (Ctrl+0)": "Ctrl+0: PDF를 뷰어 폭에 맞춤\n창 크기가 바뀌면 배율과 영역 표시도 함께 조정됩니다.",
             "외부 열기": "현재 PDF를 Windows 기본 PDF 프로그램으로 엽니다. 앱 안의 주소 영역 설정은 유지됩니다.",
             "영역 새로 지정": "마우스로 주소 영역을 새로 드래그합니다. Esc로 취소합니다.\n키보드만 사용하려면 Alt+5를 누르세요. 영역이 없으면 기본 사각형을 만들어 편집합니다.",
-            "영역 읽기": "Ctrl+R: 지정한 영역을 다시 읽고 주소 검색·PNU 미리보기를 갱신합니다.\n직접 수정한 주소가 추출 결과로 바뀝니다. 텍스트가 없으면 현재 입력을 유지합니다. OCR은 지원하지 않습니다.",
+            "영역 읽기": "Ctrl+R: 지정한 영역을 다시 읽고 주소 검색·PNU 미리보기를 갱신합니다.\n텍스트가 없으면 한글·영문 OCR을 자동 실행합니다. F8은 텍스트 유무와 관계없이 OCR로 다시 읽습니다.\nOCR 결과는 오인식할 수 있으므로 주소와 지번을 확인하세요. 빈 결과·오류는 기존 입력을 유지합니다.",
+            "OCR 읽기 (F8)": "F8: 현재 영역을 이미지로 만들어 한글·영문 OCR로 읽습니다.\n텍스트 추출 결과가 잘못됐거나 이미지와 섞여 있을 때 사용하세요. 외부 서버 전송 없이 로컬에서 처리합니다.\nEsc: OCR 취소. 파일·영역·페이지 변경이나 주소 직접 수정도 진행 중인 OCR을 취소합니다.\n처리 중에는 복사가 보류됩니다. 결과를 확인·수정한 뒤 복사하세요.",
             "영역 해제": "영역을 지우고 다음 파일의 자동 추출을 중단합니다. 현재 입력된 주소는 유지됩니다.\nTab으로 이 버튼에 이동한 뒤 Space로 실행할 수도 있습니다.",
             "키보드 편집 (Alt+5)": "Alt+5: 주소 영역 편집\n방향키: 이동 / Shift+방향키: 오른쪽·아래쪽 경계 조절\n기본 2 PDF 포인트, Ctrl을 함께 누르면 0.5포인트씩 조절합니다.\nEnter: 추출·검색 후 이전 패널로 복귀 / Esc: 변경 취소\n영역이 없으면 현재 페이지에 기본 영역을 만듭니다.",
             "파일 선택": "법정동 코드 자료 파일을 선택하고 로드합니다. 존재 상태인 법정동만 검색에 사용합니다.",
@@ -713,7 +723,7 @@ class FileMakerApp(tk.Tk):
             self.address_entry: "Alt+2: 주소 입력창으로 이동하고 전체 선택\nEnter: 검색 / Shift+방향키: 텍스트 선택 / Ctrl+C·V: 복사·붙여넣기\nAlt+3: 추천 확인 / Ctrl+Enter: 현재 선택으로 파일 복사",
             self.suggestion_list: "Alt+3: 법정동 추천 목록\n↑/↓로 후보를 바꾸면 PNU·파일명 미리보기가 갱신됩니다. Enter로 선택, Ctrl+Enter로 복사합니다.",
             self.output_list: "Alt+4: 출력 파일 목록\n↑/↓로 복사 결과를 확인합니다. Ctrl+PageUp·PageDown은 원본 PDF 파일을 바꿉니다.",
-            self.pdf_canvas: "PDF 및 주소 영역\n마우스 왼쪽 드래그: 영역 생성·이동·크기 조절 / 가운데 버튼 드래그: 화면 이동\nAlt+5: 키보드 영역 편집 / Enter: 확정 / Esc: 취소 / Ctrl+R: 다시 읽기\n편집 중 방향키는 영역 이동, Shift+방향키는 크기 조절입니다. 편집 밖에서는 방향키로 PDF를 스크롤합니다.\nPageUp·Down: 페이지 / Ctrl+PageUp·Down: 파일 / Ctrl++·-: 확대·축소 / Ctrl+0: 폭 맞춤\n영역은 다음 파일에 적용되며 앱 종료 시 초기화됩니다. OCR은 지원하지 않습니다.",
+            self.pdf_canvas: "PDF 및 주소 영역\n마우스 왼쪽 드래그: 영역 생성·이동·크기 조절 / 가운데 버튼 드래그: 화면 이동\nAlt+5: 키보드 영역 편집 / Enter: 확정 / Esc: 편집·OCR 취소 / Ctrl+R: 다시 읽기 / F8: 강제 OCR\n편집 중 방향키는 영역 이동, Shift+방향키는 크기 조절입니다. 편집 밖에서는 방향키로 PDF를 스크롤합니다.\nPageUp·Down: 페이지 / Ctrl+PageUp·Down: 파일 / Ctrl++·-: 확대·축소 / Ctrl+0: 폭 맞춤\n텍스트가 없으면 선택한 영역만 로컬 OCR로 읽습니다. 영역은 다음 파일에 적용되며 종료 시 초기화됩니다.",
         }
         variable_help = {
             str(self.source_folder): "원본 폴더 경로입니다. 오른쪽 ‘폴더’ 버튼으로 폴더를 열어 목록을 불러오세요.",
@@ -725,6 +735,7 @@ class FileMakerApp(tk.Tk):
             str(self.pnu_preview): lambda: "선택한 법정동과 지번으로 만든 19자리 PNU입니다.\n" + self.pnu_preview.get(),
             str(self.address_preview): lambda: "파일명에 사용할 전체 주소입니다.\n" + self.address_preview.get(),
             str(self.filename_preview): lambda: "복사할 파일명 미리보기입니다. 동일 이름이 있으면 번호가 추가됩니다.\n" + self.filename_preview.get(),
+            str(self.region_status): lambda: self.region_status.get() + ("\n\nOCR 원문(공백·줄바꿈 정리 전):\n" + self.last_ocr_text if self.last_ocr_text else '') + "\n\nOCR은 주소 뒤의 ‘번지 외N필’·인접 칸의 문구를 제외할 수 있습니다. 결과와 지번을 직접 확인하세요.",
         }
         for widget in self.app_widgets():
             text = widget_help.get(widget)
@@ -753,12 +764,23 @@ class FileMakerApp(tk.Tk):
             self.read_address_region()
         return "break"
 
+    def shortcut_force_ocr(self, _event=None):
+        if self.region_keyboard_edit:
+            self.finish_region_keyboard(force_ocr=True)
+        else:
+            self.read_address_region(force_ocr=True)
+        return "break"
+
     def shortcut_escape(self, _event=None):
         if self.region_keyboard_edit:
             self.cancel_region_keyboard(restore_focus=True)
             return "break"
         if self.region_drag or self.region_new:
             return self.cancel_region_drag()
+        if self.ocr_job is not None:
+            self.cancel_ocr()
+            self.region_status.set("OCR을 취소했습니다. 현재 입력은 유지됩니다.")
+            return "break"
         return None
 
     def select_source_file_in_list(self, source: Path) -> bool:
@@ -808,6 +830,9 @@ class FileMakerApp(tk.Tk):
             self.pdf_canvas.yview_scroll(dy_units, "units")
 
     def shortcut_copy(self, _event: tk.Event) -> str:
+        if self.ocr_job is not None:
+            self.region_status.set("OCR 인식 중입니다. 완료 후 복사하세요. Esc: 취소")
+            return "break"
         if self.region_keyboard_edit or self.region_drag:
             self.region_status.set("영역 편집을 먼저 확정하세요. Enter: 확정 / Esc: 취소")
             return "break"
@@ -1061,6 +1086,7 @@ class FileMakerApp(tk.Tk):
         self.pdf_status.set(message)
 
     def close_pdf_doc(self) -> None:
+        self.cancel_ocr()
         if self.current_pdf_doc is not None:
             try:
                 self.current_pdf_doc.close()
@@ -1069,6 +1095,8 @@ class FileMakerApp(tk.Tk):
         self.current_pdf_doc = None
 
     def load_pdf(self, path: Path) -> None:
+        self.cancel_ocr()
+        self.last_ocr_text = ''
         self.cancel_region_keyboard()
         self.cancel_region_drag()
         self.address_query.set("")
@@ -1158,6 +1186,7 @@ class FileMakerApp(tk.Tk):
             self.pdf_canvas.create_rectangle(x-4, y-4, x+4, y+4, fill="white", outline=color, tags="address_region")
 
     def edit_region_keyboard(self, _event=None):
+        self.cancel_ocr()
         if self.region_keyboard_edit:
             self.pdf_canvas.focus_set()
             return "break"
@@ -1217,10 +1246,10 @@ class FileMakerApp(tk.Tk):
         if widget is not None and widget.winfo_exists():
             widget.focus_set()
 
-    def finish_region_keyboard(self):
+    def finish_region_keyboard(self, force_ocr=False):
         self.region_keyboard_edit = False
         self.draw_address_region()
-        self.read_address_region()
+        self.read_address_region(force_ocr=force_ocr)
         self.restore_region_focus()
 
     def on_region_focus_out(self, _event=None):
@@ -1273,6 +1302,7 @@ class FileMakerApp(tk.Tk):
         self.pdf_canvas.configure(cursor="fleur" if mode == "move" else "crosshair")
 
     def new_address_region(self):
+        self.cancel_ocr()
         self.cancel_region_keyboard()
         self.cancel_region_drag()
         self.region_new = True
@@ -1280,6 +1310,7 @@ class FileMakerApp(tk.Tk):
         self.region_status.set("주소 영역을 새로 드래그하세요. Esc로 취소합니다.")
 
     def clear_address_region(self):
+        self.cancel_ocr()
         self.cancel_region_keyboard()
         self.cancel_region_drag()
         self.address_region = None
@@ -1298,6 +1329,7 @@ class FileMakerApp(tk.Tk):
         return "break"
 
     def on_region_start(self, event):
+        self.cancel_ocr()
         self.cancel_region_keyboard()
         page = self.region_page()
         if page is None:
@@ -1343,7 +1375,7 @@ class FileMakerApp(tk.Tk):
         self.region_new = False
         self.read_address_region()
 
-    def read_address_region(self):
+    def read_address_region(self, force_ocr=False):
         page = self.region_page()
         if self.region_drag:
             return
@@ -1353,16 +1385,84 @@ class FileMakerApp(tk.Tk):
         if self.address_region.page_index != self.pdf_state.page_index:
             self.region_status.set(f"영역은 {self.address_region.page_index + 1}페이지에 있습니다. 해당 페이지로 이동하거나 새로 지정하세요.")
             return
+        self.cancel_ocr()
+        self.last_ocr_text = ''
         try:
-            text = extract_region_text(page, self.address_region.bounds)
+            text = '' if force_ocr else extract_region_text(page, self.address_region.bounds)
             if not text:
-                self.region_status.set("영역에 추출 가능한 텍스트가 없습니다. 영역을 조절하거나 직접 입력하세요. (OCR 미지원)")
+                self.start_region_ocr(force_ocr)
                 return
             self.address_query.set(text)
             self.refresh_suggestions()
             self.region_status.set("주소 입력·검색 완료 · 영역 내부 드래그: 이동 / 모서리: 크기 조절")
         except Exception as exc:
             self.region_status.set(f"텍스트 추출 실패: {exc} · 직접 입력할 수 있습니다.")
+
+    def start_region_ocr(self, forced=False):
+        try:
+            path = self.pdf_state.path.resolve()
+            region = self.address_region
+            self.ocr_context = (path, region, self.address_query.get())
+            self.ocr_job = OcrJob(path, region.page_index, region.bounds)
+            prefix = '' if forced else '영역에 추출 가능한 텍스트가 없습니다. '
+            self.region_status.set(prefix + "OCR 인식 중… Esc: 취소 / 결과 확인 후 복사하세요.")
+            self.ocr_poll_id = self.after(80, self.poll_region_ocr)
+        except Exception as exc:
+            self.cancel_ocr()
+            self.region_status.set(f"OCR 시작 실패: {exc} · 직접 입력할 수 있습니다.")
+
+    def poll_region_ocr(self):
+        self.ocr_poll_id = None
+        job = self.ocr_job
+        if job is None:
+            return
+        try:
+            result = job.poll()
+        except Exception as exc:
+            self.cancel_ocr()
+            self.region_status.set(f"OCR 실패: {exc} · 입력은 유지됩니다.")
+            return
+        if result is None:
+            self.ocr_poll_id = self.after(80, self.poll_region_ocr)
+            return
+        context = self.ocr_context
+        self.ocr_job = None
+        self.ocr_context = None
+        path, region, query = context
+        if (self.pdf_state.path is None or self.pdf_state.path.resolve() != path
+                or self.address_region != region or self.pdf_state.page_index != region.page_index
+                or self.address_query.get() != query):
+            return
+        if result.error:
+            self.region_status.set(f"OCR 실패: {result.error} · 직접 입력할 수 있습니다.")
+            return
+        self.last_ocr_text = result.text
+        text = clean_ocr_address(result.text)
+        if not text:
+            self.region_status.set("OCR로 인식된 텍스트가 없습니다. 영역을 조절하거나 직접 입력하세요.")
+            return
+        self.address_query.set(text)
+        self.refresh_suggestions()
+        self.region_status.set(f"OCR 입력·검색 완료 ({result.seconds:.1f}초) · 주소·지번 확인 필요 / 이 안내의 툴팁에서 원문 확인")
+
+    def on_address_query_edited(self, *_args):
+        if self.ocr_job is not None:
+            self.cancel_ocr()
+            self.region_status.set("주소 직접 수정으로 OCR을 취소했습니다.")
+
+    def cancel_ocr(self):
+        if self.ocr_poll_id is not None:
+            self.after_cancel(self.ocr_poll_id)
+            self.ocr_poll_id = None
+        if self.ocr_job is not None:
+            self.ocr_job.cancel()
+            self.ocr_job = None
+            self.region_status.set("OCR을 취소했습니다. Ctrl+R로 다시 읽거나 직접 입력하세요.")
+        self.ocr_context = None
+
+    def destroy(self):
+        self.cancel_ocr()
+        super().destroy()
 
     def on_pdf_canvas_resize(self, _event: tk.Event) -> None:
         if self.pdf_state.fit_to_width and self.current_pdf_doc is not None:
@@ -1384,6 +1484,7 @@ class FileMakerApp(tk.Tk):
         self.pdf_canvas.scan_dragto(event.x, event.y, gain=1)
 
     def previous_page(self) -> None:
+        self.cancel_ocr()
         self.cancel_region_keyboard()
         if not self.current_pdf_doc or self.pdf_state.page_index <= 0:
             return
@@ -1397,6 +1498,7 @@ class FileMakerApp(tk.Tk):
         self.render_pdf_page()
 
     def next_page(self) -> None:
+        self.cancel_ocr()
         self.cancel_region_keyboard()
         if not self.current_pdf_doc or self.pdf_state.page_index >= self.pdf_state.page_count - 1:
             return
@@ -1527,6 +1629,9 @@ class FileMakerApp(tk.Tk):
         )
 
     def copy_file(self) -> None:
+        if self.ocr_job is not None:
+            self.region_status.set("OCR 인식 중입니다. 완료 후 복사하세요. Esc: 취소")
+            return
         if self.region_keyboard_edit or self.region_drag:
             self.region_status.set("영역 편집을 먼저 확정하세요. Enter: 확정 / Esc: 취소")
             return
@@ -1579,6 +1684,10 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()
+    if len(sys.argv) > 1 and sys.argv[1] == '--ocr-check':
+        from ocr_engine import check_cli
+        raise SystemExit(check_cli(sys.argv[2:]))
     main()
 
 
