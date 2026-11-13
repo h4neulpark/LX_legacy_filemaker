@@ -1,0 +1,25 @@
+# Local test data (keep the directory placeholder)
+/test_files/*
+!/test_files/.gitkeep
+
+# Python cache and local environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# PyInstaller output
+/build/
+/dist/
+
+# Per-folder application state
+.filemaker_work_state.json
+
+# OS metadata
+.DS_Store
+._*
+Thumbs.db
+Desktop.ini
