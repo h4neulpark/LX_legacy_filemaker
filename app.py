@@ -8,9 +8,11 @@ import re
 import shutil
 import sys
 import tkinter as tk
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
+
+from tooltips import Tooltip
 
 try:
     import pymupdf as fitz
@@ -408,6 +410,10 @@ class FileMakerApp(tk.Tk):
         self.address_region = None
         self.region_drag = None
         self.region_new = False
+        self.region_keyboard_edit = False
+        self.region_keyboard_original = None
+        self.region_return_focus = None
+        self.shortcut_tag = f"FileMakerShortcuts{id(self)}"
         self.render_zoom = 1.0
         self.rendered_page_index = None
 
@@ -424,6 +430,9 @@ class FileMakerApp(tk.Tk):
         self.pnu_preview = tk.StringVar(value="-")
         self.address_preview = tk.StringVar(value="-")
         self.filename_preview = tk.StringVar(value="-")
+        self.auto_next = tk.BooleanVar(value=True)
+        self.operation_status = tk.StringVar(value="복사 전 주소와 PNU를 확인하세요.")
+        self.last_copy_destination = None
 
         current_year = dt.date.today().year
         years = [str(year) for year in range(current_year - 5, current_year + 2)]
@@ -432,6 +441,7 @@ class FileMakerApp(tk.Tk):
 
         self._build_widgets(years)
         self._bind_events()
+        self._install_tooltips()
         if DEFAULT_CODE_FILE.exists():
             self.load_code_file(DEFAULT_CODE_FILE)
 
@@ -501,13 +511,14 @@ class FileMakerApp(tk.Tk):
         ttk.Button(region_bar, text="영역 새로 지정", command=self.new_address_region).pack(side=tk.LEFT, padx=(0, 4))
         ttk.Button(region_bar, text="영역 읽기", command=self.read_address_region).pack(side=tk.LEFT, padx=(0, 4))
         ttk.Button(region_bar, text="영역 해제", command=self.clear_address_region).pack(side=tk.LEFT)
+        ttk.Button(region_bar, text="키보드 편집 (Alt+5)", command=self.edit_region_keyboard).pack(side=tk.LEFT, padx=(4, 0))
         ttk.Label(parent, textvariable=self.region_status, wraplength=500).grid(row=3, column=0, sticky=tk.W, pady=(0, 4))
 
         viewer = ttk.Frame(parent)
         viewer.grid(row=4, column=0, sticky=tk.NSEW)
         viewer.columnconfigure(0, weight=1)
         viewer.rowconfigure(0, weight=1)
-        self.pdf_canvas = tk.Canvas(viewer, background="#f2f2f2", highlightthickness=0)
+        self.pdf_canvas = tk.Canvas(viewer, background="#f2f2f2", highlightthickness=1, takefocus=True)
         self.pdf_canvas.grid(row=0, column=0, sticky=tk.NSEW)
         y_scroll = ttk.Scrollbar(viewer, orient=tk.VERTICAL, command=self.pdf_canvas.yview)
         y_scroll.grid(row=0, column=1, sticky=tk.NS)
@@ -522,7 +533,8 @@ class FileMakerApp(tk.Tk):
         self.pdf_canvas.bind("<B1-Motion>", self.on_region_move)
         self.pdf_canvas.bind("<ButtonRelease-1>", self.on_region_end)
         self.pdf_canvas.bind("<Motion>", self.on_region_hover)
-        self.bind_all("<Escape>", self.cancel_region_drag)
+        self.pdf_canvas.bind("<KeyPress>", self.on_region_key)
+        self.pdf_canvas.bind("<FocusOut>", self.on_region_focus_out)
 
     def _build_output_panel(self, parent: ttk.Frame, years: list[str]) -> None:
         parent.columnconfigure(0, weight=1)
@@ -582,9 +594,17 @@ class FileMakerApp(tk.Tk):
         ttk.Label(preview, text="파일명").grid(row=2, column=0, sticky=tk.W, padx=8, pady=3)
         ttk.Label(preview, textvariable=self.filename_preview, wraplength=260).grid(row=2, column=1, sticky=tk.W, padx=8, pady=3)
 
-        ttk.Button(parent, text="복사 (Ctrl+Enter)", command=self.copy_file).grid(row=10, column=0, sticky=tk.EW, pady=(0, 10))
+        copy_panel = ttk.Frame(parent)
+        copy_panel.grid(row=10, column=0, sticky=tk.EW, pady=(0, 8))
+        copy_panel.columnconfigure(0, weight=1)
+        ttk.Button(copy_panel, text="복사 (Ctrl+Enter)", command=self.copy_file).grid(row=0, column=0, sticky=tk.EW)
+        ttk.Checkbutton(copy_panel, text="복사 후 다음 미처리 파일로 이동", variable=self.auto_next).grid(row=1, column=0, sticky=tk.W, pady=(4, 0))
+        ttk.Label(copy_panel, textvariable=self.operation_status, wraplength=330).grid(row=2, column=0, sticky=tk.W, pady=(4, 0))
 
-        ttk.Label(parent, text="출력 폴더 파일 (Alt+4)").grid(row=11, column=0, sticky=tk.W)
+        output_heading = ttk.Frame(parent)
+        output_heading.grid(row=11, column=0, sticky=tk.EW, pady=(0, 4))
+        ttk.Label(output_heading, text="출력 파일 (Alt+4)").pack(side=tk.LEFT)
+        ttk.Button(output_heading, text="출력 목록 새로고침", command=self.refresh_output_list).pack(side=tk.RIGHT)
         output_frame = ttk.Frame(parent)
         output_frame.grid(row=12, column=0, sticky=tk.NSEW, pady=(2, 0))
         output_frame.columnconfigure(0, weight=1)
@@ -594,8 +614,7 @@ class FileMakerApp(tk.Tk):
         output_scroll = ttk.Scrollbar(output_frame, orient=tk.VERTICAL, command=self.output_list.yview)
         output_scroll.grid(row=0, column=1, sticky=tk.NS)
         self.output_list.configure(yscrollcommand=output_scroll.set)
-        ttk.Button(parent, text="출력 목록 새로고침", command=self.refresh_output_list).grid(row=13, column=0, sticky=tk.EW, pady=(8, 0))
-        ttk.Label(parent, text="Alt+1 원본목록 · Alt+2 주소입력 · Shift+방향키 PDF 이동 · Ctrl+Enter 복사", wraplength=340).grid(row=14, column=0, sticky=tk.W, pady=(8, 0))
+        ttk.Label(parent, text="Alt+1~4 패널 이동 · Alt+5 영역 편집\nCtrl+PageUp/Down 파일 이동 · Ctrl+R 영역 읽기\nCtrl+Enter 복사 · 마우스 또는 Tab 포커스로 도움말", wraplength=340).grid(row=14, column=0, sticky=tk.W, pady=(8, 0))
 
     def _bind_events(self) -> None:
         self.year.trace_add("write", lambda *_: self.on_option_changed())
@@ -611,6 +630,12 @@ class FileMakerApp(tk.Tk):
         shortcut_bindings = {
             "<Control-Return>": self.shortcut_copy,
             "<Control-KP_Enter>": self.shortcut_copy,
+            "<Control-Prior>": lambda _e: self.navigate_source(-1),
+            "<Control-Next>": lambda _e: self.navigate_source(1),
+            "<Control-r>": self.shortcut_read_region,
+            "<Control-R>": self.shortcut_read_region,
+            "<Alt-5>": self.edit_region_keyboard,
+            "<Escape>": self.shortcut_escape,
             "<Alt-KeyPress-1>": self.shortcut_focus_source_list,
             "<Alt-Key-1>": self.shortcut_focus_source_list,
             "<Alt-1>": self.shortcut_focus_source_list,
@@ -633,32 +658,108 @@ class FileMakerApp(tk.Tk):
             "<Control-equal>": self.shortcut_zoom_in,
             "<Control-KP_Add>": self.shortcut_zoom_in,
             "<Control-KeyPress-0>": self.shortcut_fit_width,
-            "<Shift-Up>": self.shortcut_pan_up,
-            "<Shift-KeyPress-Up>": self.shortcut_pan_up,
-            "<Shift-Down>": self.shortcut_pan_down,
-            "<Shift-KeyPress-Down>": self.shortcut_pan_down,
-            "<Shift-Left>": self.shortcut_pan_left,
-            "<Shift-KeyPress-Left>": self.shortcut_pan_left,
-            "<Shift-Right>": self.shortcut_pan_right,
-            "<Shift-KeyPress-Right>": self.shortcut_pan_right,
         }
         for sequence, handler in shortcut_bindings.items():
-            self.bind_all(sequence, handler)
+            def dispatch(event, action=handler):
+                self.hide_tooltips()
+                return action(event)
+            self.bind_class(self.shortcut_tag, sequence, dispatch)
+        self.bind_class(self.shortcut_tag, "<KeyPress>", self.hide_tooltips)
 
-        for widget in (self.source_list, self.suggestion_list, self.output_list, self.address_entry):
-            widget.bind("<Prior>", self.shortcut_previous_page)
-            widget.bind("<Next>", self.shortcut_next_page)
-            widget.bind("<Shift-Up>", self.shortcut_pan_up)
-            widget.bind("<Shift-KeyPress-Up>", self.shortcut_pan_up)
-            widget.bind("<Shift-Down>", self.shortcut_pan_down)
-            widget.bind("<Shift-KeyPress-Down>", self.shortcut_pan_down)
-            widget.bind("<Shift-Left>", self.shortcut_pan_left)
-            widget.bind("<Shift-KeyPress-Left>", self.shortcut_pan_left)
-            widget.bind("<Shift-Right>", self.shortcut_pan_right)
-            widget.bind("<Shift-KeyPress-Right>", self.shortcut_pan_right)
+        # Run application shortcuts before widget/class handlers. Native dialogs
+        # and tooltip windows are deliberately outside this widget tree.
+        for widget in self.app_widgets():
+            widget.bindtags((self.shortcut_tag, *widget.bindtags()))
 
         self.source_list.bind("<Return>", self.shortcut_open_selected_source)
         self.suggestion_list.bind("<Return>", self.shortcut_select_suggestion)
+
+    def app_widgets(self):
+        def walk(widget):
+            yield widget
+            for child in widget.winfo_children():
+                yield from walk(child)
+        return walk(self)
+
+    def hide_tooltips(self, _event=None):
+        for tooltip in getattr(self, 'tooltips', []):
+            tooltip.hide()
+
+    def _install_tooltips(self):
+        self.tooltips = []
+        text_help = {
+            "폴더": "원본 PDF 폴더 선택\n폴더 바로 아래의 PDF만 표시합니다. 선택 후 Alt+1, ↑/↓로 파일을 바꿀 수 있습니다.",
+            "새로고침": "F5: 원본·출력 목록 새로고침\n처리 완료 표시를 다시 읽고 현재 원본 선택을 유지합니다.",
+            "이전 (PageUp)": "PageUp: PDF 이전 페이지\nCtrl+PageUp: 이전 PDF 파일. 페이지 이동은 주소를 다시 추출하지 않습니다.",
+            "다음 (PageDown)": "PageDown: PDF 다음 페이지\nCtrl+PageDown: 다음 PDF 파일. 파일을 바꾸면 유지된 영역을 자동으로 읽습니다.",
+            "축소 (Ctrl+-)": "Ctrl+-: PDF 축소\n주소 영역은 같은 문서 위치에 유지됩니다. 영역 편집 중에도 사용할 수 있습니다.",
+            "확대 (Ctrl++)": "Ctrl++ 또는 Ctrl+=: PDF 확대\n숫자 키패드의 +도 사용할 수 있습니다.",
+            "폭 맞춤 (Ctrl+0)": "Ctrl+0: PDF를 뷰어 폭에 맞춤\n창 크기가 바뀌면 배율과 영역 표시도 함께 조정됩니다.",
+            "외부 열기": "현재 PDF를 Windows 기본 PDF 프로그램으로 엽니다. 앱 안의 주소 영역 설정은 유지됩니다.",
+            "영역 새로 지정": "마우스로 주소 영역을 새로 드래그합니다. Esc로 취소합니다.\n키보드만 사용하려면 Alt+5를 누르세요. 영역이 없으면 기본 사각형을 만들어 편집합니다.",
+            "영역 읽기": "Ctrl+R: 지정한 영역을 다시 읽고 주소 검색·PNU 미리보기를 갱신합니다.\n직접 수정한 주소가 추출 결과로 바뀝니다. 텍스트가 없으면 현재 입력을 유지합니다. OCR은 지원하지 않습니다.",
+            "영역 해제": "영역을 지우고 다음 파일의 자동 추출을 중단합니다. 현재 입력된 주소는 유지됩니다.\nTab으로 이 버튼에 이동한 뒤 Space로 실행할 수도 있습니다.",
+            "키보드 편집 (Alt+5)": "Alt+5: 주소 영역 편집\n방향키: 이동 / Shift+방향키: 오른쪽·아래쪽 경계 조절\n기본 2 PDF 포인트, Ctrl을 함께 누르면 0.5포인트씩 조절합니다.\nEnter: 추출·검색 후 이전 패널로 복귀 / Esc: 변경 취소\n영역이 없으면 현재 페이지에 기본 영역을 만듭니다.",
+            "파일 선택": "법정동 코드 자료 파일을 선택하고 로드합니다. 존재 상태인 법정동만 검색에 사용합니다.",
+            "로드": "입력된 법정동 코드 파일을 다시 읽고 현재 주소의 검색 결과를 갱신합니다.",
+            "출력 폴더": "복사 결과를 저장할 폴더를 선택합니다. 원본 PDF는 그대로 보존합니다.",
+            "검색 (Enter)": "주소 입력창에서 Enter: 법정동 검색 후 첫 후보 선택\nAlt+3, ↑/↓로 다른 후보를 선택할 수 있습니다. Ctrl+Enter는 다시 검색하지 않고 현재 선택으로 복사합니다.",
+            "복사 (Ctrl+Enter)": "Ctrl+Enter: 어느 패널에서든 현재 주소·선택한 법정동으로 복사\n주소 수정 후에는 Enter로 검색하세요. 영역 편집 중에는 먼저 Enter로 확정해야 합니다.\n성공은 아래 상태줄에 표시하고, 오류·파일명 충돌은 대화상자로 안내합니다.",
+            "복사 후 다음 미처리 파일로 이동": "켜면 복사 성공 후 다음 미처리 PDF를 열고 같은 영역을 자동 추출합니다.\n목록 끝에서는 앞쪽의 미처리 파일을 찾습니다. 모두 처리했으면 현재 파일에 머뭅니다.\n끄면 현재 파일을 유지합니다. 이 옵션은 이번 실행 동안만 유지됩니다.",
+            "출력 목록 새로고침": "출력 폴더 목록을 다시 읽습니다. F5는 원본·출력 목록을 함께 갱신합니다.",
+        }
+        widget_help = {
+            self.source_list: "Alt+1: 원본 목록\n↑/↓: 파일 선택과 자동 영역 추출 / Ctrl+PageUp·PageDown: 어디서든 파일 이동\nEnter는 아직 열리지 않은 파일만 엽니다. Ctrl+Enter로 현재 파일을 복사합니다.",
+            self.address_entry: "Alt+2: 주소 입력창으로 이동하고 전체 선택\nEnter: 검색 / Shift+방향키: 텍스트 선택 / Ctrl+C·V: 복사·붙여넣기\nAlt+3: 추천 확인 / Ctrl+Enter: 현재 선택으로 파일 복사",
+            self.suggestion_list: "Alt+3: 법정동 추천 목록\n↑/↓로 후보를 바꾸면 PNU·파일명 미리보기가 갱신됩니다. Enter로 선택, Ctrl+Enter로 복사합니다.",
+            self.output_list: "Alt+4: 출력 파일 목록\n↑/↓로 복사 결과를 확인합니다. Ctrl+PageUp·PageDown은 원본 PDF 파일을 바꿉니다.",
+            self.pdf_canvas: "PDF 및 주소 영역\n마우스 왼쪽 드래그: 영역 생성·이동·크기 조절 / 가운데 버튼 드래그: 화면 이동\nAlt+5: 키보드 영역 편집 / Enter: 확정 / Esc: 취소 / Ctrl+R: 다시 읽기\n편집 중 방향키는 영역 이동, Shift+방향키는 크기 조절입니다. 편집 밖에서는 방향키로 PDF를 스크롤합니다.\nPageUp·Down: 페이지 / Ctrl+PageUp·Down: 파일 / Ctrl++·-: 확대·축소 / Ctrl+0: 폭 맞춤\n영역은 다음 파일에 적용되며 앱 종료 시 초기화됩니다. OCR은 지원하지 않습니다.",
+        }
+        variable_help = {
+            str(self.source_folder): "원본 폴더 경로입니다. 오른쪽 ‘폴더’ 버튼으로 폴더를 열어 목록을 불러오세요.",
+            str(self.output_folder): "출력 폴더 경로입니다. 복사한 PDF는 이 폴더에 저장합니다.",
+            str(self.code_file): "법정동 코드 자료 경로입니다. 경로를 바꾼 후 ‘로드’로 반영합니다.",
+            str(self.year): "파일명에 사용할 연도입니다. 방향키로 값을 선택할 수 있습니다.",
+            str(self.doc_type): "파일명에 사용할 문서 종류입니다. 방향키로 값을 선택할 수 있습니다.",
+            str(self.operation_status): lambda: "최근 복사 결과와 다음 파일 이동 상태입니다.\n" + self.operation_status.get() + (f"\n저장 위치: {self.last_copy_destination}" if self.last_copy_destination else ""),
+            str(self.pnu_preview): lambda: "선택한 법정동과 지번으로 만든 19자리 PNU입니다.\n" + self.pnu_preview.get(),
+            str(self.address_preview): lambda: "파일명에 사용할 전체 주소입니다.\n" + self.address_preview.get(),
+            str(self.filename_preview): lambda: "복사할 파일명 미리보기입니다. 동일 이름이 있으면 번호가 추가됩니다.\n" + self.filename_preview.get(),
+        }
+        for widget in self.app_widgets():
+            text = widget_help.get(widget)
+            if text is None and 'text' in widget.keys():
+                text = text_help.get(str(widget.cget('text')))
+            if text is None and 'textvariable' in widget.keys():
+                text = variable_help.get(str(widget.cget('textvariable')))
+            if text:
+                self.tooltips.append(Tooltip(widget, text))
+
+    def navigate_source(self, direction):
+        if not self.source_pdf_files:
+            return "break"
+        current = next((i for i, path in enumerate(self.source_pdf_files)
+                        if str(path) == self.source_file.get()), None)
+        target = (0 if direction > 0 else len(self.source_pdf_files)-1) if current is None else current + direction
+        if 0 <= target < len(self.source_pdf_files):
+            self.select_source_file_in_list(self.source_pdf_files[target])
+            self.select_source_pdf()
+        return "break"
+
+    def shortcut_read_region(self, _event=None):
+        if self.region_keyboard_edit:
+            self.finish_region_keyboard()
+        else:
+            self.read_address_region()
+        return "break"
+
+    def shortcut_escape(self, _event=None):
+        if self.region_keyboard_edit:
+            self.cancel_region_keyboard(restore_focus=True)
+            return "break"
+        if self.region_drag or self.region_new:
+            return self.cancel_region_drag()
+        return None
 
     def select_source_file_in_list(self, source: Path) -> bool:
         try:
@@ -707,6 +808,9 @@ class FileMakerApp(tk.Tk):
             self.pdf_canvas.yview_scroll(dy_units, "units")
 
     def shortcut_copy(self, _event: tk.Event) -> str:
+        if self.region_keyboard_edit or self.region_drag:
+            self.region_status.set("영역 편집을 먼저 확정하세요. Enter: 확정 / Esc: 취소")
+            return "break"
         self.copy_file()
         return "break"
 
@@ -728,6 +832,8 @@ class FileMakerApp(tk.Tk):
 
     def shortcut_refresh_lists(self, _event: tk.Event) -> str:
         self.refresh_source_list()
+        if self.source_file.get():
+            self.restore_source_selection(Path(self.source_file.get()))
         self.refresh_output_list()
         return "break"
 
@@ -750,27 +856,15 @@ class FileMakerApp(tk.Tk):
     def shortcut_fit_width(self, _event: tk.Event) -> str:
         self.fit_width()
         return "break"
-    def shortcut_pan_up(self, _event: tk.Event) -> str:
-        self.pan_pdf(dy_units=-3)
-        return "break"
-
-    def shortcut_pan_down(self, _event: tk.Event) -> str:
-        self.pan_pdf(dy_units=3)
-        return "break"
-
-    def shortcut_pan_left(self, _event: tk.Event) -> str:
-        self.pan_pdf(dx_units=-3)
-        return "break"
-
-    def shortcut_pan_right(self, _event: tk.Event) -> str:
-        self.pan_pdf(dx_units=3)
-        return "break"
-
     def shortcut_open_selected_source(self, _event: tk.Event) -> str:
         if not self.source_list.curselection() and self.source_pdf_files:
             self.source_list.selection_set(0)
             self.source_list.see(0)
-        self.select_source_pdf()
+        selection = self.source_list.curselection()
+        if selection and selection[0] < len(self.source_pdf_files):
+            selected = self.source_pdf_files[selection[0]]
+            if not self.source_file.get() or selected.resolve() != Path(self.source_file.get()).resolve():
+                self.select_source_pdf()
         return "break"
 
     def shortcut_select_suggestion(self, _event: tk.Event) -> str:
@@ -975,6 +1069,7 @@ class FileMakerApp(tk.Tk):
         self.current_pdf_doc = None
 
     def load_pdf(self, path: Path) -> None:
+        self.cancel_region_keyboard()
         self.cancel_region_drag()
         self.address_query.set("")
         self.current_suggestions = []
@@ -1027,6 +1122,8 @@ class FileMakerApp(tk.Tk):
             width = self.current_pdf_image.width() + 20
             height = self.current_pdf_image.height() + 20
             self.pdf_canvas.configure(scrollregion=(0, 0, width, height))
+            if self.region_keyboard_edit:
+                self.ensure_region_visible()
             mode = "폭 맞춤" if self.pdf_state.fit_to_width else f"{int(self.pdf_state.zoom * 100)}%"
             self.pdf_status.set(f"{self.pdf_state.page_index + 1}/{self.pdf_state.page_count} 페이지 · {mode}")
         except Exception as exc:
@@ -1054,9 +1151,110 @@ class FileMakerApp(tk.Tk):
         if bounds is None:
             return
         x0, y0, x1, y1 = bounds
-        self.pdf_canvas.create_rectangle(*bounds, outline="#1565c0", width=2, tags="address_region")
+        color = "#d06000" if self.region_keyboard_edit else "#1565c0"
+        self.pdf_canvas.create_rectangle(*bounds, outline=color, width=2,
+                                         dash=(5, 3) if self.region_keyboard_edit else (), tags="address_region")
         for x, y in ((x0, y0), (x1, y0), (x1, y1), (x0, y1)):
-            self.pdf_canvas.create_rectangle(x-4, y-4, x+4, y+4, fill="white", outline="#1565c0", tags="address_region")
+            self.pdf_canvas.create_rectangle(x-4, y-4, x+4, y+4, fill="white", outline=color, tags="address_region")
+
+    def edit_region_keyboard(self, _event=None):
+        if self.region_keyboard_edit:
+            self.pdf_canvas.focus_set()
+            return "break"
+        if self.region_page() is None:
+            self.region_status.set("키보드로 편집할 PDF를 먼저 여세요.")
+            return "break"
+        self.cancel_region_drag()
+        self.region_return_focus = self.focus_get()
+        self.region_keyboard_original = self.address_region
+        if self.address_region and self.address_region.page_index < self.pdf_state.page_count:
+            self.pdf_state = replace(self.pdf_state, page_index=self.address_region.page_index)
+            self.render_pdf_page()
+        if self.address_region is None or self.address_region.page_index != self.pdf_state.page_index:
+            self.address_region = AddressRegion(self.pdf_state.page_index, (.2, .2, .8, .35))
+        self.region_keyboard_edit = True
+        self.pdf_canvas.focus_set()
+        self.draw_address_region()
+        self.ensure_region_visible()
+        self.region_status.set("영역 편집 · 방향키: 이동 / Shift: 크기 / Ctrl: 미세 조절 / Enter: 추출·확정 / Esc: 취소")
+        return "break"
+
+    def ensure_region_visible(self):
+        bounds = self.region_canvas_bounds()
+        if bounds is None:
+            return
+        page = self.region_page()
+        canvas = self.pdf_canvas
+        x0, y0, x1, y1 = bounds
+        for start, end, offset, viewport, total, scroll in (
+                (x0, x1, canvas.canvasx(0), canvas.winfo_width(),
+                 page.rect.width*self.render_zoom+20, canvas.xview_moveto),
+                (y0, y1, canvas.canvasy(0), canvas.winfo_height(),
+                 page.rect.height*self.render_zoom+20, canvas.yview_moveto)):
+            target = offset
+            if end-start > viewport-24:
+                target = (start+end-viewport)/2
+            elif start < offset+12:
+                target = start-12
+            elif end > offset+viewport-12:
+                target = end-viewport+12
+            if target != offset:
+                scroll(max(0, target)/total)
+
+    def cancel_region_keyboard(self, restore_focus=False):
+        if not self.region_keyboard_edit:
+            return
+        self.address_region = self.region_keyboard_original
+        self.region_keyboard_edit = False
+        self.draw_address_region()
+        self.region_status.set("영역 편집을 취소했습니다. 기존 영역과 주소를 유지합니다.")
+        if restore_focus:
+            self.restore_region_focus()
+
+    def restore_region_focus(self):
+        widget = self.region_return_focus
+        self.region_return_focus = None
+        if widget is not None and widget.winfo_exists():
+            widget.focus_set()
+
+    def finish_region_keyboard(self):
+        self.region_keyboard_edit = False
+        self.draw_address_region()
+        self.read_address_region()
+        self.restore_region_focus()
+
+    def on_region_focus_out(self, _event=None):
+        self.cancel_region_keyboard()
+
+    def on_region_key(self, event):
+        if event.keysym in ("Return", "KP_Enter") and self.region_keyboard_edit:
+            self.finish_region_keyboard()
+            return "break"
+        directions = {"Left": (-1, 0), "Right": (1, 0), "Up": (0, -1), "Down": (0, 1)}
+        if event.keysym not in directions:
+            return None
+        dx, dy = directions[event.keysym]
+        if not self.region_keyboard_edit:
+            self.pan_pdf(dx_units=dx*3, dy_units=dy*3)
+            return "break"
+        page = self.region_page()
+        if page is None:
+            return "break"
+        step = .5 if event.state & 0x4 else 2.0
+        dx, dy = dx*step/page.rect.width, dy*step/page.rect.height
+        bounds = self.address_region.bounds
+        if event.state & 0x1:
+            x0, y0, x1, y1 = bounds
+            min_width = min(4/page.rect.width, 1-x0)
+            min_height = min(4/page.rect.height, 1-y0)
+            bounds = (x0, y0, max(x0+min_width, min(1, x1+dx)),
+                      max(y0+min_height, min(1, y1+dy)))
+        else:
+            bounds = move_bounds(bounds, dx, dy)
+        self.address_region = AddressRegion(self.pdf_state.page_index, bounds)
+        self.draw_address_region()
+        self.ensure_region_visible()
+        return "break"
 
     def region_hit(self, x, y):
         bounds = self.region_canvas_bounds()
@@ -1075,12 +1273,14 @@ class FileMakerApp(tk.Tk):
         self.pdf_canvas.configure(cursor="fleur" if mode == "move" else "crosshair")
 
     def new_address_region(self):
+        self.cancel_region_keyboard()
         self.cancel_region_drag()
         self.region_new = True
         self.pdf_canvas.configure(cursor="crosshair")
         self.region_status.set("주소 영역을 새로 드래그하세요. Esc로 취소합니다.")
 
     def clear_address_region(self):
+        self.cancel_region_keyboard()
         self.cancel_region_drag()
         self.address_region = None
         self.draw_address_region()
@@ -1098,6 +1298,7 @@ class FileMakerApp(tk.Tk):
         return "break"
 
     def on_region_start(self, event):
+        self.cancel_region_keyboard()
         page = self.region_page()
         if page is None:
             return
@@ -1183,6 +1384,7 @@ class FileMakerApp(tk.Tk):
         self.pdf_canvas.scan_dragto(event.x, event.y, gain=1)
 
     def previous_page(self) -> None:
+        self.cancel_region_keyboard()
         if not self.current_pdf_doc or self.pdf_state.page_index <= 0:
             return
         self.pdf_state = PdfRenderState(
@@ -1195,6 +1397,7 @@ class FileMakerApp(tk.Tk):
         self.render_pdf_page()
 
     def next_page(self) -> None:
+        self.cancel_region_keyboard()
         if not self.current_pdf_doc or self.pdf_state.page_index >= self.pdf_state.page_count - 1:
             return
         self.pdf_state = PdfRenderState(
@@ -1324,6 +1527,9 @@ class FileMakerApp(tk.Tk):
         )
 
     def copy_file(self) -> None:
+        if self.region_keyboard_edit or self.region_drag:
+            self.region_status.set("영역 편집을 먼저 확정하세요. Enter: 확정 / Esc: 취소")
+            return
         values = self.validate_before_copy()
         if not values:
             return
@@ -1344,7 +1550,25 @@ class FileMakerApp(tk.Tk):
         self.restore_source_selection(source)
         self.refresh_output_list(destination)
         self.update_preview()
-        messagebox.showinfo("복사 완료", f"파일을 복사했습니다.\n\n{destination}")
+        self.last_copy_destination = destination
+        self.operation_status.set("복사 완료 · 현재 파일을 유지합니다.")
+        if self.auto_next.get():
+            self.open_next_unprocessed(source)
+
+    def open_next_unprocessed(self, source):
+        files = self.source_pdf_files
+        if not files:
+            return
+        index = next((i for i, path in enumerate(files) if path.resolve() == source.resolve()), -1)
+        ordered = files[index+1:] + files[:index+1]
+        for path in ordered:
+            if path.resolve() not in self.processed_sources:
+                self.select_source_file_in_list(path)
+                self.select_source_pdf()
+                self.focus_source_list()
+                self.operation_status.set("복사 완료 · 다음 미처리 파일을 열었습니다.")
+                return
+        self.operation_status.set("복사 완료 · 모든 PDF 처리가 끝났습니다.")
     def restore_source_selection(self, source: Path) -> None:
         self.select_source_file_in_list(source)
 
