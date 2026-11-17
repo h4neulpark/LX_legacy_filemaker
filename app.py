@@ -13,6 +13,7 @@ import re
 import shutil
 import sys
 import time
+import tempfile
 import tkinter as tk
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace, field
@@ -21,6 +22,7 @@ from tkinter import filedialog, messagebox, ttk
 
 from tooltips import Tooltip
 from version import APP_VERSION
+from workspace_index import SourceIndex, OutputIndex
 from pdf_pipeline import PdfPipeline, PreparedOcrJob, TimingStats, file_identity, render_key, region_key
 
 try:
@@ -237,12 +239,10 @@ def existing_numbered_destinations(folder: Path, stem: str, suffix: str) -> dict
 
     prefix = f"{stem}__"
     result: dict[int, Path] = {}
-    for path in folder.iterdir():
-        if not path.is_file():
-            continue
-        name = path.name
-        if not name.startswith(prefix):
-            continue
+    with os.scandir(folder) as entries:
+        names = [entry.name for entry in entries
+                 if entry.name.startswith(prefix) and entry.is_file()]
+    for name in names:
         if suffix:
             if not name.endswith(suffix):
                 continue
@@ -252,7 +252,7 @@ def existing_numbered_destinations(folder: Path, stem: str, suffix: str) -> dict
         if number_text.isdigit():
             number = int(number_text)
             if number > 0:
-                result[number] = path
+                result[number] = folder / name
     return result
 
 
@@ -335,16 +335,18 @@ def copy_with_destination_plan(source_file: Path, plan: DestinationPlan) -> None
 def list_pdf_files(folder: Path) -> list[Path]:
     if not folder.is_dir():
         return []
-    return sorted(
-        [path for path in folder.iterdir() if path.is_file() and path.suffix.lower() == PDF_SUFFIX],
-        key=lambda path: path.name.lower(),
-    )
+    with os.scandir(folder) as entries:
+        return sorted((folder / entry.name for entry in entries
+                       if entry.name.lower().endswith(PDF_SUFFIX) and entry.is_file()),
+                      key=lambda path: path.name.lower())
 
 
 def list_output_files(folder: Path) -> list[Path]:
     if not folder.is_dir():
         return []
-    return sorted([path for path in folder.iterdir() if path.is_file()], key=lambda path: path.name.lower())
+    with os.scandir(folder) as entries:
+        return sorted((folder / entry.name for entry in entries if entry.is_file()),
+                      key=lambda path: path.name.lower())
 
 
 def source_pdf_counts(pdf_files: list[Path], processed_sources: set[Path]) -> tuple[int, int, int]:
@@ -376,10 +378,17 @@ def load_work_state(source_folder: Path) -> dict[str, object]:
 
 def save_work_state(source_folder: Path, state: dict[str, object]) -> None:
     source_folder.mkdir(parents=True, exist_ok=True)
-    work_state_path(source_folder).write_text(
-        json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True),
-        encoding="utf-8",
-    )
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=source_folder,
+                                         prefix='.filemaker_work_state.', suffix='.tmp',
+                                         delete=False) as stream:
+            temporary = Path(stream.name)
+            json.dump(state, stream, ensure_ascii=False, indent=2, sort_keys=True)
+        os.replace(temporary, work_state_path(source_folder))
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def build_work_state(
@@ -390,7 +399,16 @@ def build_work_state(
     year: str,
     doc_type: str,
 ) -> dict[str, object]:
-    processed_names = sorted({path.name for path in processed_sources if path.parent.resolve() == source_folder.resolve()})
+    resolved_folder = source_folder.resolve()
+    parents = {source_folder: resolved_folder, resolved_folder: resolved_folder}
+    names = set()
+    for path in processed_sources:
+        parent = path.parent
+        if parent not in parents:
+            parents[parent] = parent.resolve()
+        if parents[parent] == resolved_folder:
+            names.add(path.name)
+    processed_names = sorted(names)
     return {
         "version": 1,
         "source_folder": str(source_folder),
@@ -421,8 +439,12 @@ class FileMakerApp(tk.Tk):
         self.current_suggestions: list[LegalDong] = []
         self.selected_dong: LegalDong | None = None
         self.source_pdf_files: list[Path] = []
+        self.source_index = SourceIndex([], set())
         self.source_mouse_path = None
         self.output_files: list[Path] = []
+        self.output_index = OutputIndex([])
+        self.output_index_folder = None
+        self.defer_state_save = False
         self.processed_sources: set[Path] = set()
         self.restoring_state = False
         self.current_pdf_doc = None
@@ -848,19 +870,18 @@ class FileMakerApp(tk.Tk):
 
     def select_source_file_in_list(self, source: Path, reveal: bool = True) -> bool:
         try:
-            resolved_source = source.resolve()
+            index = self.source_index.index(source)
         except OSError:
             return False
-        for index, pdf_path in enumerate(self.source_pdf_files):
-            if pdf_path.resolve() == resolved_source:
-                self.source_list.selection_clear(0, tk.END)
-                self.source_list.selection_set(index)
-                self.source_list.activate(index)
-                self.source_list.selection_anchor(index)
-                if reveal:
-                    self.source_list.see(index)
-                return True
-        return False
+        if index is None:
+            return False
+        self.source_list.selection_clear(0, tk.END)
+        self.source_list.selection_set(index)
+        self.source_list.activate(index)
+        self.source_list.selection_anchor(index)
+        if reveal:
+            self.source_list.see(index)
+        return True
 
     def focus_source_list(self) -> None:
         self.source_list.focus_set()
@@ -1035,18 +1056,21 @@ class FileMakerApp(tk.Tk):
         return folder if folder.is_dir() else None
 
     def auto_save_work_state(self) -> None:
-        if self.restoring_state:
+        if self.restoring_state or self.defer_state_save:
             return
         folder = self.current_source_folder_path()
         if folder is None:
             return
         output = Path(self.output_folder.get()) if self.output_folder.get() else None
         selected = Path(self.source_file.get()) if self.source_file.get() else None
-        state = build_work_state(folder, output, self.processed_sources, selected, self.year.get(), self.doc_type.get())
+        started = time.perf_counter()
         try:
+            state = build_work_state(folder, output, self.processed_sources, selected, self.year.get(), self.doc_type.get())
             save_work_state(folder, state)
         except OSError as exc:
             self.status_text.set(f"작업 상태 저장 실패: {exc}")
+        finally:
+            self.performance.record('state_save', time.perf_counter() - started)
 
     def load_code_file(self, path: Path) -> None:
         try:
@@ -1080,9 +1104,11 @@ class FileMakerApp(tk.Tk):
         if load_state and folder.is_dir():
             state = load_work_state(folder)
             self.processed_sources = processed_sources_from_state(folder, self.source_pdf_files, state)
+        self.source_index = SourceIndex(self.source_pdf_files, self.processed_sources)
         self.source_list.delete(0, tk.END)
-        for pdf_path in self.source_pdf_files:
-            self.source_list.insert(tk.END, mark_processed_name(pdf_path, self.processed_sources))
+        for index, pdf_path in enumerate(self.source_pdf_files):
+            status = '[완료]' if self.source_index.canonical[index] in self.processed_sources else '[대기]'
+            self.source_list.insert(tk.END, f'{status} {pdf_path.name}')
         if current and not self.select_source_file_in_list(current, reveal=False):
             self.cancel_ocr()
             self.cancel_region_keyboard()
@@ -1108,23 +1134,31 @@ class FileMakerApp(tk.Tk):
         self.performance.record('source_refresh', time.perf_counter() - started)
 
     def update_source_counts(self) -> None:
-        total, _processed, remaining = source_pdf_counts(self.source_pdf_files, self.processed_sources)
+        total = len(self.source_pdf_files)
+        remaining = total - self.source_index.completed
         self.source_count_text.set(f"전체 PDF {total:,}개 · 남은 {remaining:,}개")
 
+    def mark_source_processed(self, source: Path):
+        return self.source_index.mark(source, self.processed_sources)
+
     def update_processed_source_row(self, source: Path) -> None:
+        started = time.perf_counter()
         vertical, horizontal = self.source_list.yview(), self.source_list.xview()
-        for index, path in enumerate(self.source_pdf_files):
-            if path.resolve() == source.resolve():
-                self.source_list.delete(index)
-                self.source_list.insert(index, mark_processed_name(path, self.processed_sources))
-                if self.source_file.get():
-                    self.select_source_file_in_list(Path(self.source_file.get()), reveal=False)
-                break
+        index = self.source_index.index(source)
+        if index is not None:
+            canonical = self.source_index.canonical[index]
+            status = '[완료]' if canonical in self.processed_sources else '[대기]'
+            for row in self.source_index.groups[canonical]:
+                self.source_list.delete(row)
+                self.source_list.insert(row, f'{status} {self.source_pdf_files[row].name}')
+            if self.source_file.get():
+                self.select_source_file_in_list(Path(self.source_file.get()), reveal=False)
         if vertical:
             self.source_list.yview_moveto(vertical[0])
         if horizontal:
             self.source_list.xview_moveto(horizontal[0])
         self.update_source_counts()
+        self.performance.record('completion_display', time.perf_counter() - started)
 
     def source_path_at_pointer(self, event) -> Path | None:
         if not (0 <= event.x < self.source_list.winfo_width()
@@ -1158,16 +1192,47 @@ class FileMakerApp(tk.Tk):
         self.preview_destination_cache = None
         folder = Path(self.output_folder.get()) if self.output_folder.get() else Path()
         self.output_files = list_output_files(folder)
+        self.output_index = OutputIndex(self.output_files)
+        self.output_index_folder = folder
         self.output_list.delete(0, tk.END)
         selected_index: int | None = None
         for index, file_path in enumerate(self.output_files):
             self.output_list.insert(tk.END, file_path.name)
-            if selected_path and file_path.resolve() == selected_path.resolve():
+            if selected_path and file_path == selected_path:
                 selected_index = index
         if selected_index is not None:
             self.output_list.selection_clear(0, tk.END)
             self.output_list.selection_set(selected_index)
             self.output_list.see(selected_index)
+
+    def update_output_after_copy(self, plan: DestinationPlan) -> None:
+        started = time.perf_counter()
+        self.preview_destination_cache = None
+        if self.output_index_folder != plan.destination.parent:
+            self.refresh_output_list(plan.destination)
+        else:
+            vertical, horizontal = self.output_list.yview(), self.output_list.xview()
+            # Remove all old names first: renumbering plans can overlap names.
+            for old, _new in plan.renames:
+                index = self.output_index.remove(old)
+                if index is not None:
+                    self.output_list.delete(index)
+            for path in [new for _old, new in plan.renames] + [plan.destination]:
+                index, added = self.output_index.insert(path)
+                if added:
+                    self.output_list.insert(index, path.name)
+            self.output_files = self.output_index.files
+            selected = self.output_index.index(plan.destination)
+            self.output_list.selection_clear(0, tk.END)
+            if selected is not None:
+                self.output_list.selection_set(selected)
+            if vertical:
+                self.output_list.yview_moveto(vertical[0])
+            if horizontal:
+                self.output_list.xview_moveto(horizontal[0])
+            if selected is not None:
+                self.output_list.see(selected)
+        self.performance.record('output_update', time.perf_counter() - started)
 
     def select_source_pdf(self) -> None:
         selection = self.source_list.curselection()
@@ -1370,13 +1435,8 @@ class FileMakerApp(tk.Tk):
                 or self.rendered_page_index != self.pdf_state.page_index
                 or self.region_drag or self.region_keyboard_edit):
             return
-        files = self.source_pdf_files
-        current = next((i for i, p in enumerate(files) if p.resolve() == self.pdf_state.path.resolve()), None)
-        if current is None:
-            return
-        ordered = files[current+1:] + files[:current]
-        candidate = next((p for p in ordered if p.resolve() not in self.processed_sources and p.is_file()), None)
-        if candidate is None:
+        candidate = self.source_index.next_pending(self.pdf_state.path, self.processed_sources)
+        if candidate is None or candidate == self.pdf_state.path or not candidate.is_file():
             return
         try:
             page = self.address_region.page_index if self.address_region else 0
@@ -1929,11 +1989,13 @@ class FileMakerApp(tk.Tk):
         if self.region_keyboard_edit or self.region_drag:
             self.region_status.set("영역 편집을 먼저 확정하세요. Enter: 확정 / Esc: 취소")
             return
+        precheck_started = time.perf_counter()
         values = self.validate_before_copy()
         if not values:
             return
         source, output, pnu, full_address = values
         plan = build_destination_plan(source, output, self.year.get(), self.doc_type.get(), pnu, full_address)
+        self.performance.record('copy_precheck', time.perf_counter() - precheck_started)
         if not self.confirm_destination_collision(plan):
             return
         self.copy_busy = True
@@ -1996,43 +2058,61 @@ class FileMakerApp(tk.Tk):
     def finish_copy(self, error: Exception | None = None) -> None:
         source, destination = self.copy_source, self.copy_plan.destination
         self.performance.record('copy_wait', time.perf_counter() - self.copy_started)
-        # Restore list widgets before repopulating them; disabled Listboxes
-        # ignore programmatic insert/delete and selection changes.
-        self.set_copy_busy_ui(False)
+        post_started = time.perf_counter()
+        restore_ui = True
         try:
             if error is not None:
+                self.set_copy_busy_ui(False)
+                restore_ui = False
                 self.operation_status.set("복사 실패 · 오류를 확인하고 다시 시도하세요.")
                 messagebox.showerror("복사 실패", f"파일을 복사하지 못했습니다.\n\n{error}")
                 return
-            self.processed_sources.add(source.resolve())
-            self.auto_save_work_state()
-            self.update_processed_source_row(source)
-            self.refresh_output_list(destination)
-            self.update_preview()
-            self.last_copy_destination = destination
-            self.operation_status.set("복사 완료 · 현재 파일을 유지합니다.")
-            if self.copy_auto_next and not self.close_after_copy:
-                self.open_next_unprocessed(source)
+            self.mark_source_processed(source)
+            # Keep the progress indicator and input guard active through cleanup.
+            self.prepare_copy_list_updates()
+            previous_defer = self.defer_state_save
+            self.defer_state_save = True
+            try:
+                self.update_processed_source_row(source)
+                self.update_output_after_copy(self.copy_plan)
+                self.update_preview()
+                self.last_copy_destination = destination
+                self.operation_status.set("복사 완료 · 현재 파일을 유지합니다.")
+                if self.copy_auto_next and not self.close_after_copy:
+                    self.open_next_unprocessed(source)
+            finally:
+                self.defer_state_save = previous_defer
+                self.auto_save_work_state()
         finally:
+            if restore_ui:
+                self.set_copy_busy_ui(False)
+            if error is None:
+                self.performance.record('copy_postprocess', time.perf_counter() - post_started)
+                self.performance.record('copy_transaction', time.perf_counter() - self.copy_started)
             self.copy_future = None
             self.copy_busy = False
             if self.close_after_copy:
                 self.destroy()
 
+    def prepare_copy_list_updates(self):
+        # Tk ignores mutations on disabled Listboxes. Re-enable just the lists;
+        # copy_busy still intercepts input until the transaction is complete.
+        for widget in self.copy_disabled_widgets:
+            if isinstance(widget, tk.Listbox):
+                widget.configure(state=tk.NORMAL)
+
     def open_next_unprocessed(self, source):
-        files = self.source_pdf_files
-        if not files:
+        started = time.perf_counter()
+        path = self.source_index.next_pending(source, self.processed_sources)
+        if path is not None:
+            self.select_source_file_in_list(path)
+            self.select_source_pdf()
+            self.source_list.focus_set()
+            self.operation_status.set("복사 완료 · 다음 미처리 파일을 열었습니다.")
+            self.performance.record('next_selection', time.perf_counter() - started)
             return
-        index = next((i for i, path in enumerate(files) if path.resolve() == source.resolve()), -1)
-        ordered = files[index+1:] + files[:index+1]
-        for path in ordered:
-            if path.resolve() not in self.processed_sources:
-                self.select_source_file_in_list(path)
-                self.select_source_pdf()
-                self.focus_source_list()
-                self.operation_status.set("복사 완료 · 다음 미처리 파일을 열었습니다.")
-                return
         self.operation_status.set("복사 완료 · 모든 PDF 처리가 끝났습니다.")
+        self.performance.record('next_selection', time.perf_counter() - started)
     def restore_source_selection(self, source: Path) -> None:
         self.select_source_file_in_list(source)
 

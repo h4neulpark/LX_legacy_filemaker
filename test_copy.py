@@ -33,10 +33,13 @@ class CopyWorkflowTests(unittest.TestCase):
             open_next_unprocessed=Mock(), after=Mock(return_value='poll'),
             destroy=Mock(),
             performance=Mock(),
+            defer_state_save=False, prepare_copy_list_updates=Mock(),
+            update_output_after_copy=Mock(),
         )
         self.ui.auto_next.get.return_value = True
         self.ui.year.get.return_value = '2026'
         self.ui.doc_type.get.return_value = '실태조사서'
+        self.ui.mark_source_processed = lambda path: self.ui.processed_sources.add(path.resolve())
         for name in ('copy_file', 'poll_copy', 'finish_copy'):
             setattr(self.ui, name, MethodType(getattr(app.FileMakerApp, name), self.ui))
 

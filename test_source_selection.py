@@ -8,6 +8,7 @@ from types import MethodType, SimpleNamespace
 from unittest.mock import Mock
 
 import app
+from workspace_index import SourceIndex
 
 
 class SourceSelectionTests(unittest.TestCase):
@@ -56,6 +57,7 @@ class SourceSelectionTests(unittest.TestCase):
         )
         self.ui.source_file.get.return_value = str(self.files[5])
         self.ui.source_folder.get.return_value = str(self.folder)
+        self.ui.source_index = SourceIndex(self.files, self.ui.processed_sources)
         for name in ('select_source_file_in_list', 'select_source_pdf',
                      'on_source_mouse_press', 'on_source_mouse_release',
                      'on_source_list_select', 'refresh_source_list',
@@ -119,7 +121,7 @@ class SourceSelectionTests(unittest.TestCase):
         self.assertEqual(self.selected, [])
 
     def test_copy_updates_only_completed_row_and_preserves_selection(self):
-        self.ui.processed_sources.add(self.files[5].resolve())
+        self.ui.source_index.mark(self.files[5], self.ui.processed_sources)
         self.ui.update_processed_source_row(self.files[5])
         self.listbox.delete.assert_called_once_with(5)
         self.assertEqual(self.selected, [5])
@@ -190,7 +192,7 @@ class SourceSelectionGuiTests(unittest.TestCase):
         source = self.root.source_pdf_files[0]
         self.root.select_source_file_in_list(source)
         self.root.select_source_pdf()
-        self.root.processed_sources.add(source.resolve())
+        self.root.mark_source_processed(source)
         self.root.update_processed_source_row(source)
         self.root.open_next_unprocessed(source)
         self.root.update()

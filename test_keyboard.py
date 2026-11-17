@@ -175,7 +175,7 @@ class KeyboardWorkflowTests(unittest.TestCase):
         output.mkdir()
         self.root.output_folder.set(str(output))
         three = Path(self.tmp.name) / 'three.pdf'
-        self.root.processed_sources.add(three.resolve())
+        self.root.mark_source_processed(three)
         with patch('app.messagebox.showinfo') as success:
             self.root.copy_file()
             self.wait_for_copy()
@@ -188,6 +188,7 @@ class KeyboardWorkflowTests(unittest.TestCase):
             success.assert_not_called()
         # A pending earlier item is found after reaching the end of the list.
         self.root.processed_sources.discard(self.pdf.resolve())
+        self.root.refresh_source_list(load_state=False)
         self.root.open_next_unprocessed(Path(self.tmp.name) / 'two.pdf')
         self.assertEqual(Path(self.root.source_file.get()).name, 'one.pdf')
 
@@ -240,6 +241,7 @@ class KeyboardWorkflowTests(unittest.TestCase):
         self.assertEqual(Path(self.root.source_file.get()).name, 'one.pdf')
         self.root.auto_next.set(True)
         self.root.processed_sources.clear()
+        self.root.refresh_source_list(load_state=False)
         with patch('app.copy_with_destination_plan', side_effect=OSError('test failure')), \
              patch('app.messagebox.showerror') as error, \
              patch.object(self.root, 'confirm_destination_collision', return_value=True):

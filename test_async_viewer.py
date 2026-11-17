@@ -5,6 +5,7 @@ from types import MethodType, SimpleNamespace
 from unittest.mock import Mock, patch
 
 import app
+from workspace_index import SourceIndex
 from pdf_pipeline import render_key, RenderedPage, region_key
 
 
@@ -80,6 +81,7 @@ class AsyncViewerTests(unittest.TestCase):
         next_file.write_bytes(b'PDF')
         self.ui.source_pdf_files = [self.path, done, next_file]
         self.ui.processed_sources = {done.resolve()}
+        self.ui.source_index = SourceIndex(self.ui.source_pdf_files, self.ui.processed_sources)
         self.ui.rendered_page_index = 0
         self.ui.copy_busy = False
         self.ui.ocr_job = None
