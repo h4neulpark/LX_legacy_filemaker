@@ -43,6 +43,10 @@ class SurveyGuiTests(unittest.TestCase):
         self.assertTrue(condition(),self.root.survey_status.get()+' / '+self.root.operation_status.get())
 
     def test_visible_toolbox_and_three_verified_copies(self):
+        self.root.geometry('1080x740')
+        self.root.update()
+        self.assertGreaterEqual(self.root.main_panes.winfo_width()-self.root.main_panes.sashpos(1),340)
+        self.assertEqual(int(self.root.pdf_toolbar_buttons[4].grid_info()['row']),1)
         self.assertTrue(self.root.survey_tools.winfo_ismapped())
         self.assertFalse(self.root.single_preview.winfo_ismapped())
         self.assertEqual(self.root.selected_dong.code,'4111513900')

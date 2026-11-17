@@ -498,6 +498,9 @@ class FileMakerApp(SurveyWorkflow, tk.Tk):
         self.load_started = None
         self.loaded_file_identity = None
         self.preview_destination_cache = None
+        self.pane_layout_id = None
+        self.pane_last_width = 0
+        self.pdf_toolbar_narrow = None
         self.init_survey()
 
         self.code_file = tk.StringVar(value=str(DEFAULT_CODE_FILE))
@@ -534,7 +537,7 @@ class FileMakerApp(SurveyWorkflow, tk.Tk):
         self.columnconfigure(0, weight=1)
         self.rowconfigure(0, weight=1)
 
-        main = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
+        main = self.main_panes = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
         main.grid(row=0, column=0, sticky=tk.NSEW)
 
         left = ttk.Frame(main, padding=10)
@@ -547,6 +550,41 @@ class FileMakerApp(SurveyWorkflow, tk.Tk):
         self._build_source_panel(left)
         self._build_pdf_panel(center)
         self._build_output_panel(right, years)
+        self.bind('<Configure>', self.on_window_configure, add='+')
+
+    def on_window_configure(self, event):
+        if event.widget is self and event.width >= 600 and self.pane_layout_id is None:
+            self.pane_layout_id = self.after_idle(self.layout_panes)
+
+    def layout_panes(self):
+        self.pane_layout_id = None
+        width = self.main_panes.winfo_width()
+        if width == self.pane_last_width or width < 600:
+            return
+        if not self.pane_last_width:
+            self.main_panes.sashpos(0, int(max(180, min(230, width*.18))))
+            self.main_panes.sashpos(1, int(width-max(360, min(410, width*.29))))
+        else:
+            left, right = self.main_panes.sashpos(0), self.main_panes.sashpos(1)
+            left = max(180, min(left, width-360-360))
+            right = max(left+360, min(right, width-360))
+            self.main_panes.sashpos(0, left)
+            self.main_panes.sashpos(1, right)
+        self.pane_last_width = width
+
+    def layout_pdf_toolbar(self, event):
+        narrow = event.width < 700
+        if narrow == self.pdf_toolbar_narrow:
+            return
+        self.pdf_toolbar_narrow = narrow
+        for index, button in enumerate(self.pdf_toolbar_buttons):
+            if narrow and index >= 4:
+                button.grid_configure(row=1, column=(index-4)*2, columnspan=2, sticky=tk.W, pady=(3,0))
+            else:
+                button.grid_configure(row=0, column=index, columnspan=1, sticky='', pady=0)
+        self.pdf_toolbar_status.grid_configure(row=1 if narrow else 0,
+                                               column=4 if narrow else 8,
+                                               columnspan=5 if narrow else 1)
 
     def _build_source_panel(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(0, weight=1)
@@ -589,7 +627,10 @@ class FileMakerApp(SurveyWorkflow, tk.Tk):
         ttk.Button(toolbar, text="확대 (Ctrl++)", command=self.zoom_in).grid(row=0, column=3, padx=(0, 4))
         ttk.Button(toolbar, text="폭 맞춤 (Ctrl+0)", command=self.fit_width).grid(row=0, column=4, padx=(0, 12))
         ttk.Button(toolbar, text="외부 열기", command=self.open_external_pdf).grid(row=0, column=5, padx=(0, 12))
-        ttk.Label(toolbar, textvariable=self.pdf_status).grid(row=0, column=8, sticky=tk.E)
+        self.pdf_toolbar_buttons = [w for w in toolbar.winfo_children() if isinstance(w, ttk.Button)]
+        self.pdf_toolbar_status = ttk.Label(toolbar, textvariable=self.pdf_status)
+        self.pdf_toolbar_status.grid(row=0, column=8, sticky=tk.E)
+        toolbar.bind('<Configure>', self.layout_pdf_toolbar)
 
         region_bar = self.address_region_bar = ttk.Frame(parent)
         region_bar.grid(row=2, column=0, sticky=tk.EW, pady=(0, 4))
@@ -1888,7 +1929,7 @@ class FileMakerApp(SurveyWorkflow, tk.Tk):
             return
         self.close_pdf_doc()
         self.cancel_survey_read()
-        for attribute in ('pipeline_poll_id', 'resize_after_id', 'prefetch_after_id'):
+        for attribute in ('pipeline_poll_id', 'resize_after_id', 'prefetch_after_id', 'pane_layout_id'):
             pending = getattr(self, attribute)
             if pending is not None:
                 self.after_cancel(pending)

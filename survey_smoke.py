@@ -51,6 +51,9 @@ def run(app_class, output):
         source = source_folder/'survey.pdf'
         make_fixture(source)
         root = app_class()
+        for tooltip in root.tooltips:
+            tooltip.delay = 100000
+        root.hide_tooltips()
         width, height = min(1450,root.winfo_screenwidth()-30), min(920,root.winfo_screenheight()-80)
         root.geometry(f'{width}x{height}+10+10')
         root.load_source_workspace(source_folder)
@@ -82,6 +85,7 @@ def run(app_class, output):
                     root.set_zoom(.55)
                     phase='rendering'
                 elif phase=='rendering' and root.rendered_page_index==root.pdf_state.page_index:
+                    root.hide_tooltips()
                     root.update_idletasks()
                     preview = dict(phase='ready', x=root.winfo_rootx(), y=root.winfo_rooty(),
                                    width=root.winfo_width(), height=root.winfo_height())

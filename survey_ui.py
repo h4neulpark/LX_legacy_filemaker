@@ -428,8 +428,9 @@ class SurveyWorkflow:
                 address = f'{dong.name} {lot.display}'
                 suffix = Path(self.source_file.get()).suffix or '.pdf'
                 filename = f'{self.year.get()}_측량성과도_{pnu}_{self.survey_sanitize(address)}{suffix}'
+            status = row.status if row.status in ('복사 완료', '이전 성공 확인', '실패') else row.warning or row.status
             self.survey_tree.insert('', tk.END, iid=str(i), values=(
-                '포함' if row.enabled else '제외', row.lot, pnu, row.warning or row.status, filename))
+                '포함' if row.enabled else '제외', row.lot, pnu, status, filename))
         if selected and self.survey_tree.exists(selected[0]):
             self.survey_tree.selection_set(selected[0])
         if not self.copy_busy:
