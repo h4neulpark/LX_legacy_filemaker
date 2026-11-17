@@ -65,6 +65,7 @@ class RegionGuiTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = app.FileMakerApp()
+        self.root.doc_type.set('실태조사서')
         self.addCleanup(self.root.destroy)
         self.addCleanup(self.root.close_pdf_doc)
         self.root.update()

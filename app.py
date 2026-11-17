@@ -23,6 +23,7 @@ from tkinter import filedialog, messagebox, ttk
 from tooltips import Tooltip
 from version import APP_VERSION
 from workspace_index import SourceIndex, OutputIndex
+from survey_ui import SurveyWorkflow
 from pdf_pipeline import PdfPipeline, PreparedOcrJob, TimingStats, file_identity, render_key, region_key
 
 try:
@@ -300,36 +301,39 @@ def build_destination_path(
     return build_destination_plan(source_file, output_folder, year, doc_type, pnu, full_address).destination
 
 
-def temporary_copy_path(destination: Path) -> Path:
-    counter = 0
-    while True:
-        suffix = ".tmp" if counter == 0 else f".tmp{counter}"
-        candidate = destination.with_name(f".{destination.name}{suffix}")
-        if not candidate.exists():
-            return candidate
-        counter += 1
-
-
 def copy_with_destination_plan(source_file: Path, plan: DestinationPlan) -> None:
-    if not plan.renames:
-        shutil.copy2(source_file, plan.destination)
-        return
-
-    temp_destination = temporary_copy_path(plan.destination)
-    temp_created = False
+    resolved_source = source_file.resolve()
+    if (plan.destination.resolve() == resolved_source
+            or any(old.resolve() == resolved_source for old, _new in plan.renames)):
+        raise ValueError('원본 PDF와 출력 파일명이 겹칩니다. 다른 출력 폴더를 선택하세요.')
+    # Reserve a unique staging file before writing, including for single copies.
+    # A partial copy must never be left under the final PDF name.
+    with tempfile.NamedTemporaryFile(dir=plan.destination.parent,
+                                     prefix='.filemaker-copy-', suffix='.tmp', delete=False) as stream:
+        temp_destination = Path(stream.name)
+    renamed = []
     try:
         shutil.copy2(source_file, temp_destination)
-        temp_created = True
         for old_path, new_path in plan.renames:
             old_path.rename(new_path)
-        temp_destination.rename(plan.destination)
-        temp_created = False
-    finally:
-        if temp_created and temp_destination.exists():
+            renamed.append((old_path, new_path))
+        if os.name == 'nt':
+            # Windows rename refuses to replace an existing destination.
+            temp_destination.rename(plan.destination)
+        else:
+            # Atomic no-replace publication for POSIX development/test hosts.
+            os.link(temp_destination, plan.destination)
+            temp_destination.unlink()
+    except Exception:
+        for old_path, new_path in reversed(renamed):
             try:
-                temp_destination.unlink()
+                if new_path.exists() and not old_path.exists():
+                    new_path.rename(old_path)
             except OSError:
                 pass
+        raise
+    finally:
+        temp_destination.unlink(missing_ok=True)
 
 
 def list_pdf_files(folder: Path) -> list[Path]:
@@ -428,7 +432,21 @@ def processed_sources_from_state(source_folder: Path, pdf_files: list[Path], sta
     return {path.resolve() for path in pdf_files if path.name in processed_names and path.parent.resolve() == source_folder.resolve()}
 
 
-class FileMakerApp(tk.Tk):
+class FileMakerApp(SurveyWorkflow, tk.Tk):
+    survey_parse_lot = staticmethod(parse_lot_number)
+    survey_make_pnu = staticmethod(make_pnu)
+    survey_sanitize = staticmethod(sanitize_filename_part)
+    survey_build_plan = staticmethod(build_destination_plan)
+    survey_plan_factory = staticmethod(destination_plan_for_stem)
+    survey_plan_type = DestinationPlan
+    survey_copy_plan = staticmethod(copy_with_destination_plan)
+    survey_build_state = staticmethod(build_work_state)
+    survey_save_state = staticmethod(save_work_state)
+
+    @staticmethod
+    def survey_clean_header(text):
+        return clean_ocr_address(text)
+
     def __init__(self) -> None:
         super().__init__()
         self.title(APP_TITLE)
@@ -480,6 +498,7 @@ class FileMakerApp(tk.Tk):
         self.load_started = None
         self.loaded_file_identity = None
         self.preview_destination_cache = None
+        self.init_survey()
 
         self.code_file = tk.StringVar(value=str(DEFAULT_CODE_FILE))
         self.source_folder = tk.StringVar()
@@ -507,6 +526,7 @@ class FileMakerApp(tk.Tk):
         self._bind_events()
         self.address_query.trace_add('write', self.on_address_query_edited)
         self._install_tooltips()
+        self.sync_survey_mode()
         if DEFAULT_CODE_FILE.exists():
             self.load_code_file(DEFAULT_CODE_FILE)
 
@@ -571,14 +591,15 @@ class FileMakerApp(tk.Tk):
         ttk.Button(toolbar, text="외부 열기", command=self.open_external_pdf).grid(row=0, column=5, padx=(0, 12))
         ttk.Label(toolbar, textvariable=self.pdf_status).grid(row=0, column=8, sticky=tk.E)
 
-        region_bar = ttk.Frame(parent)
+        region_bar = self.address_region_bar = ttk.Frame(parent)
         region_bar.grid(row=2, column=0, sticky=tk.EW, pady=(0, 4))
         ttk.Button(region_bar, text="영역 새로 지정", command=self.new_address_region).pack(side=tk.LEFT, padx=(0, 4))
         ttk.Button(region_bar, text="영역 읽기", command=self.read_address_region).pack(side=tk.LEFT, padx=(0, 4))
         ttk.Button(region_bar, text="영역 해제", command=self.clear_address_region).pack(side=tk.LEFT)
         ttk.Button(region_bar, text="키보드 편집 (Alt+5)", command=self.edit_region_keyboard).pack(side=tk.LEFT, padx=(4, 0))
         ttk.Button(region_bar, text="OCR 읽기 (F8)", command=self.shortcut_force_ocr).pack(side=tk.LEFT, padx=(4, 0))
-        ttk.Label(parent, textvariable=self.region_status, wraplength=500).grid(row=3, column=0, sticky=tk.W, pady=(0, 4))
+        self.address_region_status = ttk.Label(parent, textvariable=self.region_status, wraplength=500)
+        self.address_region_status.grid(row=3, column=0, sticky=tk.W, pady=(0, 4))
 
         viewer = ttk.Frame(parent)
         viewer.grid(row=4, column=0, sticky=tk.NSEW)
@@ -600,6 +621,7 @@ class FileMakerApp(tk.Tk):
         self.pdf_canvas.bind("<ButtonRelease-1>", self.on_region_end)
         self.pdf_canvas.bind("<Motion>", self.on_region_hover)
         self.pdf_canvas.bind("<KeyPress>", self.on_region_key)
+        self.build_survey_tools(parent)
         self.pdf_canvas.bind("<FocusOut>", self.on_region_focus_out)
 
     def _build_output_panel(self, parent: ttk.Frame, years: list[str]) -> None:
@@ -650,7 +672,7 @@ class FileMakerApp(tk.Tk):
 
         ttk.Label(parent, textvariable=self.selected_info, wraplength=340).grid(row=8, column=0, sticky=tk.W, pady=(6, 8))
 
-        preview = ttk.LabelFrame(parent, text="미리보기")
+        preview = self.single_preview = ttk.LabelFrame(parent, text="미리보기")
         preview.grid(row=9, column=0, sticky=tk.EW, pady=(0, 8))
         preview.columnconfigure(1, weight=1)
         ttk.Label(preview, text="PNU").grid(row=0, column=0, sticky=tk.W, padx=8, pady=3)
@@ -802,20 +824,38 @@ class FileMakerApp(tk.Tk):
             "복사 (Ctrl+Enter)": "Ctrl+Enter: 어느 패널에서든 현재 주소·선택한 법정동으로 복사\nWindows에서는 마우스 뒤로/앞으로 버튼(XButton1/2)으로도 복사합니다.\n주소 수정 후에는 Enter로 검색하세요. 영역 편집 중에는 먼저 Enter로 확정해야 합니다.\n성공은 아래 상태줄에 표시하고, 오류·파일명 충돌은 대화상자로 안내합니다.",
             "복사 후 다음 미처리 파일로 이동": "켜면 복사 성공 후 다음 미처리 PDF를 열고 같은 영역을 자동 추출합니다.\n목록 끝에서는 앞쪽의 미처리 파일을 찾습니다. 모두 처리했으면 현재 파일에 머뭅니다.\n끄면 현재 파일을 유지합니다. 이 옵션은 이번 실행 동안만 유지됩니다.",
             "출력 목록 새로고침": "출력 폴더 목록을 다시 읽습니다. F5는 원본·출력 목록을 함께 갱신합니다.",
+            "토지소재 영역": "상단 토지소재 글씨를 드래그합니다. 공통 법정동은 오른쪽 추천 목록에서 확인하세요.",
+            "지번 열 영역": "면적표의 지번 열만 드래그합니다. 면적 숫자와 도면의 다른 지번은 포함하지 마세요.",
+            "두 영역 읽기": "토지소재와 검정 지번을 다시 읽습니다. 빨간 글씨는 색상 분리 후 제외합니다. F8 또는 Ctrl+R도 사용할 수 있습니다.",
+            "읽기 취소": "측량성과도 영역 읽기를 중단합니다. 기존 입력은 유지합니다. Esc로도 취소할 수 있습니다.",
+            "추가": "입력한 지번을 복사 목록에 추가합니다. 같은 지번은 중복 추가하지 않습니다.",
+            "수정": "선택한 행의 지번을 수정합니다. 공통 법정동은 오른쪽 주소 검색에서 수정하세요.",
+            "삭제": "선택한 지번을 목록에서 제거합니다. 원본 PDF와 이미 복사한 파일은 그대로 유지합니다.",
+            "포함/제외": "선택한 행을 이번 일괄 복사에 포함하거나 제외합니다. 목록에서 Space로도 전환할 수 있습니다.",
         }
         widget_help = {
+            self.survey_tree: "첫 칸 클릭 또는 Space: 포함/제외. 행을 선택하면 원문 위치를 표시합니다. 지번을 수정한 뒤 확인 체크를 다시 하세요.",
+            self.survey_entry: "예: 301-6, 산12-3. 추가 또는 수정 버튼을 누르면 PNU와 파일명이 함께 갱신됩니다.",
+            self.copy_button: "Ctrl+Enter 또는 마우스 뒤로/앞으로: 복사. 측량성과도는 확인한 지번을 모두 복사하며, 전부 성공한 뒤 다음 PDF로 이동합니다.",
             self.source_list: "Alt+1: 원본 목록\n↑/↓: 파일 선택과 자동 영역 추출 / Ctrl+PageUp·PageDown: 어디서든 파일 이동\nEnter는 아직 열리지 않은 파일만 엽니다. Ctrl+Enter로 현재 파일을 복사합니다.",
             self.address_entry: "Alt+2: 주소 입력창으로 이동하고 전체 선택\nEnter: 검색 / Shift+방향키: 텍스트 선택 / Ctrl+C·V: 복사·붙여넣기\nAlt+3: 추천 확인 / Ctrl+Enter: 현재 선택으로 파일 복사",
             self.suggestion_list: "Alt+3: 법정동 추천 목록\n↑/↓로 후보를 바꾸면 PNU·파일명 미리보기가 갱신됩니다. Enter로 선택, Ctrl+Enter로 복사합니다.",
             self.output_list: "Alt+4: 출력 파일 목록\n↑/↓로 복사 결과를 확인합니다. Ctrl+PageUp·PageDown은 원본 PDF 파일을 바꿉니다.",
             self.pdf_canvas: "PDF 및 주소 영역\n마우스 왼쪽 드래그: 영역 생성·이동·크기 조절 / 가운데 버튼 드래그: 화면 이동\nAlt+5: 키보드 영역 편집 / Enter: 확정 / Esc: 편집·OCR 취소 / Ctrl+R: 다시 읽기 / F8: 강제 OCR\n편집 중 방향키는 영역 이동, Shift+방향키는 크기 조절입니다. 편집 밖에서는 방향키로 PDF를 스크롤합니다.\nPageUp·Down: 페이지 / Ctrl+PageUp·Down: 파일 / Ctrl++·-: 확대·축소 / Ctrl+0: 폭 맞춤\n텍스트가 없으면 선택한 영역만 로컬 OCR로 읽습니다. 영역은 다음 파일에 적용되며 종료 시 초기화됩니다.",
         }
+        single_canvas_help = widget_help[self.pdf_canvas]
+        widget_help[self.pdf_canvas] = lambda: (
+            '측량성과도: 아래 토지소재/지번 열 버튼을 누른 뒤 영역을 드래그하세요.\n'
+            '지번 목록의 행을 선택하면 해당 위치를 표시합니다.\n'
+            'Ctrl+R 또는 F8: 두 영역 다시 읽기 / Esc: 읽기·드래그 취소\n'
+            '가운데 버튼: 화면 이동 / Ctrl++·-: 확대·축소 / Ctrl+0: 폭 맞춤'
+            if self.is_survey() else single_canvas_help)
         variable_help = {
             str(self.source_folder): "원본 폴더 경로입니다. 오른쪽 ‘폴더’ 버튼으로 폴더를 열어 목록을 불러오세요.",
             str(self.output_folder): "출력 폴더 경로입니다. 복사한 PDF는 이 폴더에 저장합니다.",
             str(self.code_file): "법정동 코드 자료 경로입니다. 경로를 바꾼 후 ‘로드’로 반영합니다.",
             str(self.year): "파일명에 사용할 연도입니다. 방향키로 값을 선택할 수 있습니다.",
-            str(self.doc_type): "파일명에 사용할 문서 종류입니다. 방향키로 값을 선택할 수 있습니다.",
+            str(self.doc_type): "실태조사서는 단일 주소로 복사하며, 측량성과도는 검정 지번 목록을 확인해 일괄 복사합니다.",
             str(self.operation_status): lambda: "최근 복사 결과와 다음 파일 이동 상태입니다.\n" + self.operation_status.get() + (f"\n저장 위치: {self.last_copy_destination}" if self.last_copy_destination else ""),
             str(self.pnu_preview): lambda: "선택한 법정동과 지번으로 만든 19자리 PNU입니다.\n" + self.pnu_preview.get(),
             str(self.address_preview): lambda: "파일명에 사용할 전체 주소입니다.\n" + self.address_preview.get(),
@@ -843,6 +883,8 @@ class FileMakerApp(tk.Tk):
         return "break"
 
     def shortcut_read_region(self, _event=None):
+        if self.is_survey():
+            return self.read_survey_regions(force=True)
         if self.region_keyboard_edit:
             self.finish_region_keyboard()
         else:
@@ -850,6 +892,8 @@ class FileMakerApp(tk.Tk):
         return "break"
 
     def shortcut_force_ocr(self, _event=None):
+        if self.is_survey():
+            return self.read_survey_regions(force=True)
         if self.region_keyboard_edit:
             self.finish_region_keyboard(force_ocr=True)
         else:
@@ -857,6 +901,12 @@ class FileMakerApp(tk.Tk):
         return "break"
 
     def shortcut_escape(self, _event=None):
+        if self.is_survey() and (self.survey_reading or self.survey_drag or self.survey_edit_target):
+            self.cancel_survey_read()
+            self.survey_drag = None
+            self.survey_edit_target = None
+            self.draw_survey_regions()
+            return 'break'
         if self.region_keyboard_edit:
             self.cancel_region_keyboard(restore_focus=True)
             return "break"
@@ -1005,11 +1055,14 @@ class FileMakerApp(tk.Tk):
             self.output_folder.set(path)
 
     def on_output_folder_changed(self) -> None:
+        self.invalidate_survey_review()
         self.refresh_output_list()
         self.update_preview()
         self.auto_save_work_state()
 
     def on_option_changed(self) -> None:
+        self.invalidate_survey_review()
+        self.sync_survey_mode()
         self.update_preview()
         self.auto_save_work_state()
 
@@ -1018,6 +1071,7 @@ class FileMakerApp(tk.Tk):
         try:
             self.source_folder.set(str(folder))
             state = load_work_state(folder)
+            self.restore_survey_state(state)
             saved_output = state.get("output_folder")
             if isinstance(saved_output, str) and saved_output and Path(saved_output).is_dir():
                 self.output_folder.set(saved_output)
@@ -1066,6 +1120,7 @@ class FileMakerApp(tk.Tk):
         started = time.perf_counter()
         try:
             state = build_work_state(folder, output, self.processed_sources, selected, self.year.get(), self.doc_type.get())
+            state.update(self.export_survey_state())
             save_work_state(folder, state)
         except OSError as exc:
             self.status_text.set(f"작업 상태 저장 실패: {exc}")
@@ -1255,6 +1310,9 @@ class FileMakerApp(tk.Tk):
         self.auto_save_work_state()
 
     def refresh_suggestions(self) -> None:
+        if self.is_survey() and not self.survey_applying:
+            self.cancel_survey_read()
+            self.invalidate_survey_review()
         started = time.perf_counter()
         query = self.address_query.get()
         self.current_suggestions = search_legal_dongs(query, self.legal_dongs)
@@ -1276,6 +1334,9 @@ class FileMakerApp(tk.Tk):
         self.update_preview()
 
     def select_current_suggestion(self) -> None:
+        if self.is_survey() and not self.survey_applying:
+            self.cancel_survey_read()
+            self.invalidate_survey_review()
         selection = self.suggestion_list.curselection()
         if not selection:
             return
@@ -1287,6 +1348,7 @@ class FileMakerApp(tk.Tk):
         self.update_preview()
 
     def clear_pdf_viewer(self, message: str) -> None:
+        self.reset_survey_source()
         self.close_pdf_doc()
         self.rendered_page_index = None
         self.pdf_state = PdfRenderState()
@@ -1315,11 +1377,16 @@ class FileMakerApp(tk.Tk):
         self.current_pdf_doc = None
 
     def load_pdf(self, path: Path) -> None:
+        self.reset_survey_source(path)
         self.cancel_ocr()
         self.last_ocr_text = ''
         self.cancel_region_keyboard()
         self.cancel_region_drag()
-        self.address_query.set("")
+        self.survey_applying = True
+        try:
+            self.address_query.set("")
+        finally:
+            self.survey_applying = False
         self.current_suggestions = []
         self.suggestion_list.delete(0, tk.END)
         self.selected_dong = None
@@ -1338,17 +1405,18 @@ class FileMakerApp(tk.Tk):
             if page_count == 0:
                 self.clear_pdf_viewer("페이지가 없는 PDF입니다.")
                 return
-            target = self.address_region.page_index if self.address_region else 0
+            target = (self.survey_regions['header'][0] if self.is_survey()
+                      else self.address_region.page_index if self.address_region else 0)
             page_index = target if target < page_count else 0
             self.pdf_state = PdfRenderState(path=path, page_index=page_index, page_count=page_count, zoom=1.0, fit_to_width=True)
             self.rendered_page_index = None
             self.current_pdf_image = None
             self.pdf_canvas.delete('all')
-            if self.address_region and target < page_count:
+            if not self.is_survey() and self.address_region and target < page_count:
                 self.pending_region_read = (self.load_generation, page_index,
                                             self.address_region, self.address_query.get())
             self.render_pdf_page()
-            if self.address_region:
+            if not self.is_survey() and self.address_region:
                 if target >= page_count:
                     self.region_status.set(f"지정한 {target + 1}페이지가 없습니다. 첫 페이지에서 영역을 새로 지정하세요.")
         except Exception as exc:
@@ -1390,6 +1458,8 @@ class FileMakerApp(tk.Tk):
             self.render_zoom = rendered.zoom
             self.rendered_page_index = page_index
             self.draw_address_region()
+            if self.is_survey() and self.survey_reveal_after_render:
+                self.reveal_survey_row()
             width, height = rendered.width + 20, rendered.height + 20
             self.pdf_canvas.configure(scrollregion=(0, 0, width, height))
             if self.region_keyboard_edit:
@@ -1403,7 +1473,9 @@ class FileMakerApp(tk.Tk):
                 self.performance.record('file_to_display', time.perf_counter() - self.load_started)
                 self.load_started = None
             pending, self.pending_region_read = self.pending_region_read, None
-            if pending == (self.load_generation, page_index, self.address_region, self.address_query.get()):
+            if self.is_survey():
+                self.maybe_read_survey()
+            elif not self.is_survey() and pending == (self.load_generation, page_index, self.address_region, self.address_query.get()):
                 self.read_address_region()
             self.schedule_prefetch()
         except Exception as exc:
@@ -1416,6 +1488,8 @@ class FileMakerApp(tk.Tk):
     def poll_pipeline(self):
         self.pipeline_poll_id = None
         for key, value, error in self.pipeline.poll(include_prepare=not isinstance(self.ocr_job, PreparedOcrJob)):
+            if key[0] == 'survey':
+                self.handle_survey_result(key, value, error)
             if key[0] == 'render' and self.render_request and key == self.render_request[0]:
                 if error:
                     self.clear_pdf_viewer(f'PDF 표시 실패: {error}')
@@ -1439,6 +1513,14 @@ class FileMakerApp(tk.Tk):
         if candidate is None or candidate == self.pdf_state.path or not candidate.is_file():
             return
         try:
+            if self.is_survey():
+                from pdf_pipeline import survey_key
+                header, lots = self.survey_regions['header'], self.survey_regions['lots']
+                self.pipeline.request_render(render_key(candidate, header[0], 1.0,
+                                                         max(self.pdf_canvas.winfo_width()-24, 200)))
+                self.pipeline.request_survey(survey_key(candidate, header, lots))
+                self.ensure_pipeline_poll()
+                return
             page = self.address_region.page_index if self.address_region else 0
             width = max(self.pdf_canvas.winfo_width() - 24, 200)
             self.pipeline.request_render(render_key(candidate, page, 1.0, width))
@@ -1466,7 +1548,10 @@ class FileMakerApp(tk.Tk):
                 10 + y1 * page.rect.height * self.render_zoom)
 
     def draw_address_region(self):
+        self.draw_survey_regions()
         self.pdf_canvas.delete("address_region")
+        if self.is_survey():
+            return
         bounds = self.region_canvas_bounds()
         if bounds is None:
             return
@@ -1478,6 +1563,9 @@ class FileMakerApp(tk.Tk):
             self.pdf_canvas.create_rectangle(x-4, y-4, x+4, y+4, fill="white", outline=color, tags="address_region")
 
     def edit_region_keyboard(self, _event=None):
+        if self.is_survey():
+            self.survey_status.set('측량성과도는 아래 두 영역 버튼을 누른 뒤 마우스로 지정하세요.')
+            return 'break'
         self.cancel_ocr()
         if self.region_keyboard_edit:
             self.pdf_canvas.focus_set()
@@ -1588,6 +1676,9 @@ class FileMakerApp(tk.Tk):
         return "move" if x0 <= x <= x1 and y0 <= y <= y1 else "new"
 
     def on_region_hover(self, event):
+        if self.is_survey():
+            self.pdf_canvas.configure(cursor='crosshair' if self.survey_edit_target else '')
+            return
         if self.region_drag or self.region_page() is None:
             return
         mode = self.region_hit(self.pdf_canvas.canvasx(event.x), self.pdf_canvas.canvasy(event.y))
@@ -1621,6 +1712,8 @@ class FileMakerApp(tk.Tk):
         return "break"
 
     def on_region_start(self, event):
+        if self.is_survey():
+            return self.survey_region_start(event)
         self.cancel_ocr()
         self.cancel_region_keyboard()
         page = self.region_page()
@@ -1638,6 +1731,8 @@ class FileMakerApp(tk.Tk):
         self.draw_address_region()
 
     def on_region_move(self, event):
+        if self.is_survey():
+            return self.survey_region_move(event)
         page = self.region_page()
         if self.region_drag is None or page is None:
             return
@@ -1655,6 +1750,8 @@ class FileMakerApp(tk.Tk):
         self.draw_address_region()
 
     def on_region_end(self, event):
+        if self.is_survey():
+            return self.survey_region_end(event)
         if self.region_drag is None:
             return
         self.on_region_move(event)
@@ -1668,6 +1765,8 @@ class FileMakerApp(tk.Tk):
         self.read_address_region()
 
     def read_address_region(self, force_ocr=False):
+        if self.is_survey():
+            return self.read_survey_regions(force=force_ocr)
         page = self.region_page()
         if self.region_drag:
             return
@@ -1765,6 +1864,9 @@ class FileMakerApp(tk.Tk):
         self.region_status.set(f"OCR 입력·검색 완료 ({result.seconds:.1f}초) · 주소·지번 확인 필요 / 이 안내의 툴팁에서 원문 확인")
 
     def on_address_query_edited(self, *_args):
+        if self.is_survey() and not self.survey_applying:
+            self.invalidate_survey_review()
+            self.cancel_survey_read()
         if self.ocr_job is not None:
             self.cancel_ocr()
             self.region_status.set("주소 직접 수정으로 OCR을 취소했습니다.")
@@ -1785,6 +1887,7 @@ class FileMakerApp(tk.Tk):
             self.operation_status.set("복사 완료 후 앱을 종료합니다…")
             return
         self.cancel_ocr()
+        self.cancel_survey_read()
         for attribute in ('pipeline_poll_id', 'resize_after_id', 'prefetch_after_id'):
             pending = getattr(self, attribute)
             if pending is not None:
@@ -1912,6 +2015,9 @@ class FileMakerApp(tk.Tk):
         return pnu, full_address, filename
 
     def update_preview(self) -> None:
+        self.refresh_survey_rows()
+        if self.is_survey():
+            return
         values = self.preview_values()
         if not values:
             self.pnu_preview.set("-")
@@ -1977,6 +2083,9 @@ class FileMakerApp(tk.Tk):
         )
 
     def copy_file(self) -> None:
+        if self.doc_type.get() == '측량성과도':
+            self.copy_survey_files()
+            return
         if self.copy_busy:
             return
         if (getattr(self, 'render_request', None) is not None
@@ -2135,6 +2244,22 @@ if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == '--pipeline-check':
         from pdf_pipeline import check_cli
         raise SystemExit(check_cli(sys.argv[2:]))
+    if len(sys.argv) > 1 and sys.argv[1] == '--survey-check':
+        from survey_ocr import check_cli
+        raise SystemExit(check_cli(sys.argv[2:]))
+    if len(sys.argv) > 1 and sys.argv[1] == '--survey-ui-check':
+        from survey_smoke import run
+        import argparse
+        parser = argparse.ArgumentParser()
+        parser.add_argument('--output', required=True)
+        output = parser.parse_args(sys.argv[2:]).output
+        try:
+            status = run(FileMakerApp, output)
+        except Exception:
+            import traceback
+            Path(output).write_text(json.dumps({'error':traceback.format_exc()}), encoding='utf-8')
+            status = 1
+        raise SystemExit(status)
     main()
 
 

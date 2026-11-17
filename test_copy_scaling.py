@@ -73,6 +73,7 @@ def workspace(folder, total=1300, completed=1000):
         defer_state_save=False, restoring_state=False, preview_destination_cache=None,
         performance=app.TimingStats(), pdf_state=app.PdfRenderState(path=current),
         set_copy_busy_ui=Mock(), prepare_copy_list_updates=Mock(), update_preview=Mock(),
+        export_survey_state=Mock(return_value={}),
     )
 
     def load(path):

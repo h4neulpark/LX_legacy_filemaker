@@ -36,7 +36,7 @@ jobs:
         run: python -m pip install -r requirements-dev.txt
 
       - name: Run tests and Windows selection event checks
-        run: python -m unittest test_app test_copy test_copy_scaling test_workspace_index test_source_selection test_async_viewer test_pdf_pipeline test_pdf_region.RegionGeometryTests test_ocr.OcrEngineTests
+        run: python -m unittest test_app test_copy test_copy_scaling test_workspace_index test_source_selection test_async_viewer test_pdf_pipeline test_survey_batch test_survey_workflow test_survey_ocr test_survey_gui test_pdf_region.RegionGeometryTests test_ocr.OcrEngineTests
 
       - name: Build standalone EXE
         run: python -m PyInstaller --noconfirm --clean '법정동PNU파일복사도구.spec'
@@ -56,6 +56,43 @@ jobs:
             if ($sample -eq 'scanned' -and -not $data.region.ocr) { throw 'Scanned PDF did not use OCR' }
             $data | ConvertTo-Json -Depth 3
           }
+
+      - name: Check survey GUI and batch copy in built EXE
+        shell: pwsh
+        run: |
+          $exe = Get-Item 'dist/법정동PNU파일복사도구_v*.exe'
+          $report = 'build/survey-ui-check.json'
+          $process = Start-Process -FilePath $exe.FullName -WorkingDirectory $PWD.Path -ArgumentList @('--survey-ui-check', '--output', $report) -PassThru
+          $deadline = (Get-Date).AddSeconds(60)
+          while (-not (Test-Path $report)) {
+            if ($process.HasExited -or (Get-Date) -gt $deadline) { throw 'Survey GUI did not become ready' }
+            Start-Sleep -Milliseconds 200
+          }
+          $preview = Get-Content -Raw -Encoding utf8 $report | ConvertFrom-Json
+          if ($preview.error) { throw $preview.error }
+          try {
+            Add-Type -AssemblyName System.Drawing
+            $bitmap = [System.Drawing.Bitmap]::new([int]$preview.width, [int]$preview.height)
+            $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+            $graphics.CopyFromScreen([int]$preview.x, [int]$preview.y, 0, 0, $bitmap.Size)
+            $bitmap.Save((Join-Path $PWD 'build/survey-ui.png'), [System.Drawing.Imaging.ImageFormat]::Png)
+            $graphics.Dispose()
+            $bitmap.Dispose()
+          } catch { Write-Host "Preview capture unavailable: $_" }
+          New-Item -ItemType File -Path 'build/survey-ui-check.release' -Force | Out-Null
+          if (-not $process.WaitForExit(60000)) { throw 'Survey GUI copy check timed out' }
+          if ($process.ExitCode -ne 0) { throw 'Survey GUI copy check failed' }
+          $result = Get-Content -Raw -Encoding utf8 $report | ConvertFrom-Json
+          if ($result.phase -ne 'passed' -or $result.copies -ne 3) { throw 'Survey batch output invalid' }
+          $result | ConvertTo-Json
+
+      - name: Upload survey UI preview
+        uses: actions/upload-artifact@v4
+        with:
+          name: survey-ui-preview
+          path: build/survey-ui.png
+          if-no-files-found: ignore
+          retention-days: 30
 
       - name: Upload Windows EXE
         uses: actions/upload-artifact@v4

@@ -22,6 +22,10 @@ def region_key(path, page, bounds):
     return ('region', file_identity(path), page, tuple(bounds))
 
 
+def survey_key(path, header, lots):
+    return ('survey', file_identity(path), header, lots)
+
+
 @dataclass(frozen=True)
 class RenderedPage:
     ppm: bytes
@@ -73,7 +77,11 @@ def _worker(connection):
         while True:
             key, operation, args = connection.recv()
             try:
-                result = (render_document if operation == 'render' else prepare_region)(*args)
+                if operation == 'survey':
+                    from survey_ocr import read_survey
+                    result = read_survey(*args)
+                else:
+                    result = (render_document if operation == 'render' else prepare_region)(*args)
                 connection.send((key, result, ''))
             except Exception as exc:
                 connection.send((key, None, str(exc)))
@@ -163,6 +171,11 @@ class BoundedCache:
         self.items.move_to_end(key)
         return entry[0]
 
+    def discard(self, key):
+        old = self.items.pop(key, None)
+        if old is not None:
+            self.bytes -= old[1]
+
     def put(self, key, value, weight):
         old = self.items.pop(key, None)
         if old is not None:
@@ -209,6 +222,13 @@ class PdfPipeline:
         if self.regions.get(key) is None:
             _, identity, page, bounds = key
             self.prepare.submit(key, 'region', (identity[0], page, bounds))
+
+    def request_survey(self, key):
+        cached = self.regions.get(key)
+        if cached is None:
+            _, identity, header, lots = key
+            self.prepare.submit(key, 'survey', (identity[0], header, lots))
+        return cached
 
     def poll(self, include_prepare=True):
         results = []

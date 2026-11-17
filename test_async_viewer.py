@@ -24,6 +24,7 @@ class AsyncViewerTests(unittest.TestCase):
             pdf_status=Mock(), performance=Mock(), load_started=None,
             address_region=None, address_query=Mock(), pending_region_read=None,
             read_address_region=Mock(), schedule_prefetch=Mock(), clear_pdf_viewer=Mock(),
+            is_survey=Mock(return_value=False),
         )
         self.ui.address_query.get.return_value = ''
         self.ui.apply_rendered_page = MethodType(app.FileMakerApp.apply_rendered_page, self.ui)
