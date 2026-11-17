@@ -1,5 +1,8 @@
 # -*- mode: python ; coding: utf-8 -*-
+import runpy
+from pathlib import Path
 
+app_version = runpy.run_path(str(Path(SPECPATH) / 'version.py'))['APP_VERSION']
 
 a = Analysis(
     ['app.py'],
@@ -22,7 +25,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='법정동PNU파일복사도구',
+    name=f'법정동PNU파일복사도구_v{app_version}',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

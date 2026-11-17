@@ -28,9 +28,11 @@ class CopyWorkflowTests(unittest.TestCase):
             confirm_destination_collision=Mock(return_value=True),
             set_copy_busy_ui=Mock(), auto_save_work_state=Mock(),
             refresh_source_list=Mock(), restore_source_selection=Mock(),
+            update_processed_source_row=Mock(),
             refresh_output_list=Mock(), update_preview=Mock(),
             open_next_unprocessed=Mock(), after=Mock(return_value='poll'),
             destroy=Mock(),
+            performance=Mock(),
         )
         self.ui.auto_next.get.return_value = True
         self.ui.year.get.return_value = '2026'
@@ -80,7 +82,8 @@ class CopyWorkflowTests(unittest.TestCase):
         self.assertIsNone(self.ui.copy_future)
         self.assertEqual(self.ui.last_copy_destination.read_bytes(), self.source.read_bytes())
         self.assertIn(self.source.resolve(), self.ui.processed_sources)
-        self.ui.restore_source_selection.assert_called_once_with(self.source)
+        self.ui.update_processed_source_row.assert_called_once_with(self.source)
+        self.ui.refresh_source_list.assert_not_called()
         self.ui.open_next_unprocessed.assert_called_once_with(self.source)
         self.ui.set_copy_busy_ui.assert_called_with(False)
 

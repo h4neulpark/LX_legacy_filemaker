@@ -35,16 +35,32 @@ jobs:
       - name: Install dependencies
         run: python -m pip install -r requirements-dev.txt
 
-      - name: Run tests without desktop interaction
-        run: python -m unittest test_app test_copy test_pdf_region.RegionGeometryTests test_ocr.OcrEngineTests
+      - name: Run tests and Windows selection event checks
+        run: python -m unittest test_app test_copy test_source_selection test_async_viewer test_pdf_pipeline test_pdf_region.RegionGeometryTests test_ocr.OcrEngineTests
 
       - name: Build standalone EXE
         run: python -m PyInstaller --noconfirm --clean '법정동PNU파일복사도구.spec'
+
+      - name: Check spawned workers in built EXE
+        shell: pwsh
+        run: |
+          python tools/make_pipeline_fixture.py
+          if ($LASTEXITCODE -ne 0) { throw 'Fixture creation failed' }
+          $exe = Get-Item 'dist/법정동PNU파일복사도구_v*.exe'
+          foreach ($sample in @('native', 'scanned')) {
+            $report = "build/frozen-$sample.json"
+            $process = Start-Process -FilePath $exe.FullName -WorkingDirectory $PWD.Path -ArgumentList @('--pipeline-check', "build/$sample.pdf", '--output', $report) -Wait -PassThru
+            if ($process.ExitCode -ne 0) { throw "Frozen $sample check failed" }
+            $data = Get-Content -Raw -Encoding utf8 $report | ConvertFrom-Json
+            if ($data.error -or $data.region.text -notmatch '123') { throw "Frozen $sample output invalid" }
+            if ($sample -eq 'scanned' -and -not $data.region.ocr) { throw 'Scanned PDF did not use OCR' }
+            $data | ConvertTo-Json -Depth 3
+          }
 
       - name: Upload Windows EXE
         uses: actions/upload-artifact@v4
         with:
           name: filemaker-windows-amd64
-          path: dist/법정동PNU파일복사도구.exe
+          path: dist/법정동PNU파일복사도구_v*.exe
           if-no-files-found: error
           retention-days: 30

@@ -14,16 +14,19 @@ class KeyboardWorkflowTests(unittest.TestCase):
     event = region_tests.RegionGuiTests.event
     select_address = region_tests.RegionGuiTests.select_address
     wait_for_copy = region_tests.RegionGuiTests.wait_for_copy
+    wait_for_render = region_tests.RegionGuiTests.wait_for_render
 
     def focus(self, widget):
         self.root.deiconify()
         self.root.update()
         widget.focus_force()
         self.root.update()
+        self.wait_for_render()
 
     def press(self, sequence):
         self.root.focus_get().event_generate(sequence)
         self.root.update()
+        self.wait_for_render()
 
     def workspace(self):
         self.make_pdf('two.pdf', '서울특별시 종로구 이화동 1-4', pages=2)
@@ -273,6 +276,7 @@ class KeyboardWorkflowTests(unittest.TestCase):
         from pdf_region import AddressRegion
         self.focus(self.root.address_entry)
         self.root.set_zoom(2)
+        self.wait_for_render()
         self.root.address_region = AddressRegion(0, (.8, .8, .9, .9))
         self.root.pdf_canvas.xview_moveto(0)
         self.root.pdf_canvas.yview_moveto(0)

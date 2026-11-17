@@ -44,12 +44,22 @@ class RegionGeometryTests(unittest.TestCase):
 
 
 class RegionGuiTests(unittest.TestCase):
+    def wait_for_render(self):
+        deadline = time.monotonic() + 15
+        while self.root.rendered_page_index != self.root.pdf_state.page_index and time.monotonic() < deadline:
+            self.root.update()
+            time.sleep(.01)
+        self.assertEqual(self.root.rendered_page_index, self.root.pdf_state.page_index,
+                         self.root.pdf_status.get())
+
     def wait_for_copy(self):
         deadline = time.monotonic() + 5
         while self.root.copy_busy and time.monotonic() < deadline:
             self.root.update()
             time.sleep(.01)
         self.assertFalse(self.root.copy_busy, 'Copy did not finish')
+        if self.root.current_pdf_doc is not None:
+            self.wait_for_render()
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -61,6 +71,7 @@ class RegionGuiTests(unittest.TestCase):
         self.root.withdraw()
         self.pdf = self.make_pdf('one.pdf', '서울특별시 종로구 세종로 76-2')
         self.root.load_pdf(self.pdf)
+        self.wait_for_render()
 
     def make_pdf(self, name, text='', pages=1, width=600, height=800):
         path = Path(self.tmp.name) / name
@@ -73,6 +84,7 @@ class RegionGuiTests(unittest.TestCase):
         return path
 
     def event(self, relative_x, relative_y):
+        self.wait_for_render()
         page = self.root.region_page()
         x = 10 + relative_x * page.rect.width * self.root.render_zoom
         y = 10 + relative_y * page.rect.height * self.root.render_zoom
@@ -91,6 +103,7 @@ class RegionGuiTests(unittest.TestCase):
         region = self.root.address_region
         other = self.make_pdf('two.pdf', '서울특별시 종로구 이화동 1-4')
         self.root.load_pdf(other)
+        self.wait_for_render()
         self.assertEqual(self.root.address_region, region)
         self.assertIn('이화동', self.root.address_query.get())
         self.assertEqual(self.root.selected_dong.code, '1111016500')
@@ -121,6 +134,7 @@ class RegionGuiTests(unittest.TestCase):
         self.root.read_address_region()
         self.assertEqual(self.root.address_query.get(), text)
         self.root.load_pdf(self.make_pdf('blank.pdf'))
+        self.wait_for_render()
         self.assertEqual(self.root.address_query.get(), '')
         self.assertIsNone(self.root.selected_dong)
         self.assertEqual(self.root.pnu_preview.get(), '-')
@@ -141,6 +155,7 @@ class RegionGuiTests(unittest.TestCase):
         self.assertEqual(self.root.address_query.get(), '')
         self.assertIn('페이지가 없습니다', self.root.region_status.get())
         self.root.load_pdf(multi)
+        self.wait_for_render()
         self.assertEqual(self.root.pdf_state.page_index, 1)
         self.assertIn('세종로', self.root.address_query.get())
 
@@ -148,12 +163,14 @@ class RegionGuiTests(unittest.TestCase):
         self.select_address()
         region = self.root.address_region
         self.root.set_zoom(2)
+        self.wait_for_render()
         self.root.pdf_canvas.xview_moveto(.2)
         self.root.pdf_canvas.yview_moveto(.1)
         self.root.on_region_start(self.event(.4, .12))
         self.root.on_region_end(self.event(.42, .12))
         self.assertAlmostEqual(self.root.address_region.bounds[0], region.bounds[0]+.02)
         self.root.fit_width()
+        self.wait_for_render()
         self.assertEqual(len(self.root.pdf_canvas.find_withtag('address_region')), 5)
         self.root.new_address_region()
         self.root.on_region_start(self.event(.9, .2))

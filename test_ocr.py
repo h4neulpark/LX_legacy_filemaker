@@ -69,6 +69,7 @@ class OcrGuiTests(unittest.TestCase):
     event = region_tests.RegionGuiTests.event
     select_address = region_tests.RegionGuiTests.select_address
     wait_for_copy = region_tests.RegionGuiTests.wait_for_copy
+    wait_for_render = region_tests.RegionGuiTests.wait_for_render
 
     def select_blank_region(self):
         self.root.address_region = AddressRegion(0, (.8, .8, 1, 1))
@@ -161,6 +162,7 @@ class OcrGuiTests(unittest.TestCase):
             self.root.address_region = None
             self.root.source_file.set(str(staged))
             self.root.load_pdf(staged)
+            self.wait_for_render()
             self.assertEqual(self.root.region_page().get_text().strip(), '')
             self.root.new_address_region()
             self.root.on_region_start(self.event(bounds[0], bounds[1]))

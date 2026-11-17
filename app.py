@@ -1,20 +1,27 @@
 from __future__ import annotations
 
+import multiprocessing
+
+if __name__ == "__main__":
+    multiprocessing.freeze_support()
+
 import csv
 import datetime as dt
 import json
-import multiprocessing
 import os
 import re
 import shutil
 import sys
+import time
 import tkinter as tk
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, replace, field
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 from tooltips import Tooltip
+from version import APP_VERSION
+from pdf_pipeline import PdfPipeline, PreparedOcrJob, TimingStats, file_identity, render_key, region_key
 
 try:
     import pymupdf as fitz
@@ -24,7 +31,7 @@ except ImportError:  # pragma: no cover - exercised only on machines missing the
     fitz = None
 
 
-APP_TITLE = "법정동 PNU PDF 정리 도구"
+APP_TITLE = f"법정동 PNU PDF 정리 도구 v{APP_VERSION}"
 APP_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
 DEFAULT_CODE_FILE = APP_DIR / "법정동코드 전체자료.txt"
 ENCODINGS = ("utf-8-sig", "cp949", "euc-kr")
@@ -41,6 +48,10 @@ class LegalDong:
     name: str
     compact_name: str
     tokens: tuple[str, ...]
+    normalized_tokens: tuple[str, ...] = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self):
+        object.__setattr__(self, 'normalized_tokens', tuple(normalize_text(t) for t in self.tokens))
 
 
 @dataclass(frozen=True)
@@ -170,6 +181,11 @@ def make_pnu(legal_dong_code: str, lot: LotNumber) -> str:
 def score_match(query: str, dong: LegalDong) -> int:
     stripped = strip_lot_from_query(query)
     compact_query = normalize_text(stripped)
+    tokens = tuple(normalize_text(t) for t in stripped.split())
+    return score_prepared(compact_query, tokens, dong)
+
+
+def score_prepared(compact_query: str, query_tokens: tuple[str, ...], dong: LegalDong) -> int:
     if not compact_query:
         return 0
 
@@ -181,12 +197,10 @@ def score_match(query: str, dong: LegalDong) -> int:
     elif dong.compact_name in compact_query:
         score += 500
 
-    query_tokens = [token for token in stripped.split() if token]
-    for token in query_tokens:
-        compact_token = normalize_text(token)
+    for compact_token in query_tokens:
         if not compact_token:
             continue
-        if any(compact_token == normalize_text(dong_token) for dong_token in dong.tokens):
+        if compact_token in dong.normalized_tokens:
             score += 120
         elif compact_token in dong.compact_name:
             score += 60
@@ -197,7 +211,10 @@ def score_match(query: str, dong: LegalDong) -> int:
 
 
 def search_legal_dongs(query: str, dongs: list[LegalDong], limit: int = 20) -> list[LegalDong]:
-    scored = [(score_match(query, dong), dong) for dong in dongs]
+    stripped = strip_lot_from_query(query)
+    compact = normalize_text(stripped)
+    tokens = tuple(normalize_text(t) for t in stripped.split())
+    scored = [(score_prepared(compact, tokens, dong), dong) for dong in dongs]
     filtered = [(score, dong) for score, dong in scored if score > 0]
     filtered.sort(key=lambda item: (-item[0], item[1].name))
     return [dong for _, dong in filtered[:limit]]
@@ -404,6 +421,7 @@ class FileMakerApp(tk.Tk):
         self.current_suggestions: list[LegalDong] = []
         self.selected_dong: LegalDong | None = None
         self.source_pdf_files: list[Path] = []
+        self.source_mouse_path = None
         self.output_files: list[Path] = []
         self.processed_sources: set[Path] = set()
         self.restoring_state = False
@@ -428,6 +446,18 @@ class FileMakerApp(tk.Tk):
         self.copy_busy = False
         self.close_after_copy = False
         self.copy_disabled_widgets = []
+        self.pipeline = PdfPipeline()
+        self.performance = TimingStats()
+        self.performance_report = None
+        self.pipeline_poll_id = None
+        self.resize_after_id = None
+        self.prefetch_after_id = None
+        self.render_request = None
+        self.load_generation = 0
+        self.pending_region_read = None
+        self.load_started = None
+        self.loaded_file_identity = None
+        self.preview_destination_cache = None
 
         self.code_file = tk.StringVar(value=str(DEFAULT_CODE_FILE))
         self.source_folder = tk.StringVar()
@@ -639,7 +669,13 @@ class FileMakerApp(tk.Tk):
         self.doc_type.trace_add("write", lambda *_: self.on_option_changed())
         self.source_file.trace_add("write", lambda *_: self.update_preview())
         self.output_folder.trace_add("write", lambda *_: self.on_output_folder_changed())
-        self.source_list.bind("<<ListboxSelect>>", lambda _event: self.select_source_pdf())
+        self.source_list.bind("<<ListboxSelect>>", self.on_source_list_select)
+        self.source_list.bind("<ButtonPress-1>", self.on_source_mouse_press)
+        self.source_list.bind("<Double-ButtonPress-1>", self.on_source_mouse_press)
+        self.source_list.bind("<ButtonRelease-1>", self.on_source_mouse_release)
+        # This list opens documents on a completed click, not while dragging.
+        self.source_list.bind("<B1-Motion>", lambda _event: "break")
+        self.source_list.bind("<B1-Leave>", lambda _event: "break")
         self.suggestion_list.bind("<<ListboxSelect>>", lambda _event: self.select_current_suggestion())
         self.address_entry.bind("<Return>", lambda _event: self.refresh_suggestions())
         self.bind_shortcuts()
@@ -810,7 +846,7 @@ class FileMakerApp(tk.Tk):
             return "break"
         return None
 
-    def select_source_file_in_list(self, source: Path) -> bool:
+    def select_source_file_in_list(self, source: Path, reveal: bool = True) -> bool:
         try:
             resolved_source = source.resolve()
         except OSError:
@@ -820,7 +856,9 @@ class FileMakerApp(tk.Tk):
                 self.source_list.selection_clear(0, tk.END)
                 self.source_list.selection_set(index)
                 self.source_list.activate(index)
-                self.source_list.see(index)
+                self.source_list.selection_anchor(index)
+                if reveal:
+                    self.source_list.see(index)
                 return True
         return False
 
@@ -884,8 +922,6 @@ class FileMakerApp(tk.Tk):
 
     def shortcut_refresh_lists(self, _event: tk.Event) -> str:
         self.refresh_source_list()
-        if self.source_file.get():
-            self.restore_source_selection(Path(self.source_file.get()))
         self.refresh_output_list()
         return "break"
 
@@ -1032,6 +1068,13 @@ class FileMakerApp(tk.Tk):
         self.refresh_suggestions()
 
     def refresh_source_list(self, load_state: bool = True) -> None:
+        started = time.perf_counter()
+        self.source_mouse_path = None
+        current = Path(self.source_file.get()) if self.source_file.get() else None
+        old_files = self.source_pdf_files
+        top_index = self.source_list.nearest(0) if old_files else 0
+        top_path = old_files[top_index] if 0 <= top_index < len(old_files) else None
+        vertical, horizontal = self.source_list.yview(), self.source_list.xview()
         folder = Path(self.source_folder.get()) if self.source_folder.get() else Path()
         self.source_pdf_files = list_pdf_files(folder)
         if load_state and folder.is_dir():
@@ -1040,13 +1083,79 @@ class FileMakerApp(tk.Tk):
         self.source_list.delete(0, tk.END)
         for pdf_path in self.source_pdf_files:
             self.source_list.insert(tk.END, mark_processed_name(pdf_path, self.processed_sources))
-        total, _processed, remaining = source_pdf_counts(self.source_pdf_files, self.processed_sources)
-        self.source_count_text.set(f"전체 PDF {total:,}개 · 남은 {remaining:,}개")
+        if current and not self.select_source_file_in_list(current, reveal=False):
+            self.cancel_ocr()
+            self.cancel_region_keyboard()
+            self.cancel_region_drag()
+            self.source_file.set("")
+            self.address_query.set("")
+            self.current_suggestions = []
+            self.suggestion_list.delete(0, tk.END)
+            self.selected_dong = None
+            self.selected_info.set("선택된 법정동이 없습니다.")
+            self.update_preview()
+            self.clear_pdf_viewer("현재 PDF가 목록에 없습니다. 다른 파일을 선택하세요.")
+        if top_path in self.source_pdf_files:
+            self.source_list.yview(self.source_pdf_files.index(top_path))
+        elif vertical:
+            self.source_list.yview_moveto(vertical[0])
+        if horizontal:
+            self.source_list.xview_moveto(horizontal[0])
+        self.update_source_counts()
         if not self.source_pdf_files:
             self.source_file.set("")
             self.clear_pdf_viewer("선택한 폴더에 PDF가 없습니다.")
+        self.performance.record('source_refresh', time.perf_counter() - started)
+
+    def update_source_counts(self) -> None:
+        total, _processed, remaining = source_pdf_counts(self.source_pdf_files, self.processed_sources)
+        self.source_count_text.set(f"전체 PDF {total:,}개 · 남은 {remaining:,}개")
+
+    def update_processed_source_row(self, source: Path) -> None:
+        vertical, horizontal = self.source_list.yview(), self.source_list.xview()
+        for index, path in enumerate(self.source_pdf_files):
+            if path.resolve() == source.resolve():
+                self.source_list.delete(index)
+                self.source_list.insert(index, mark_processed_name(path, self.processed_sources))
+                if self.source_file.get():
+                    self.select_source_file_in_list(Path(self.source_file.get()), reveal=False)
+                break
+        if vertical:
+            self.source_list.yview_moveto(vertical[0])
+        if horizontal:
+            self.source_list.xview_moveto(horizontal[0])
+        self.update_source_counts()
+
+    def source_path_at_pointer(self, event) -> Path | None:
+        if not (0 <= event.x < self.source_list.winfo_width()
+                and 0 <= event.y < self.source_list.winfo_height()):
+            return None
+        index = self.source_list.nearest(event.y)
+        bounds = self.source_list.bbox(index)
+        if not bounds or not bounds[1] <= event.y < bounds[1] + bounds[3]:
+            return None
+        return self.source_pdf_files[index] if 0 <= index < len(self.source_pdf_files) else None
+
+    def on_source_mouse_press(self, event):
+        self.source_mouse_path = None if self.copy_busy else self.source_path_at_pointer(event)
+        if not self.copy_busy:
+            self.source_list.focus_set()
+        return "break"
+
+    def on_source_mouse_release(self, event):
+        source, self.source_mouse_path = self.source_mouse_path, None
+        if (not self.copy_busy and source is not None
+                and source == self.source_path_at_pointer(event)
+                and self.select_source_file_in_list(source, reveal=False)):
+            self.select_source_pdf()
+        return "break"
+
+    def on_source_list_select(self, _event=None):
+        if not self.copy_busy and self.source_mouse_path is None:
+            self.select_source_pdf()
 
     def refresh_output_list(self, selected_path: Path | None = None) -> None:
+        self.preview_destination_cache = None
         folder = Path(self.output_folder.get()) if self.output_folder.get() else Path()
         self.output_files = list_output_files(folder)
         self.output_list.delete(0, tk.END)
@@ -1068,13 +1177,23 @@ class FileMakerApp(tk.Tk):
         if index >= len(self.source_pdf_files):
             return
         pdf_path = self.source_pdf_files[index]
+        if (self.pdf_state.path is not None
+                and self.pdf_state.path.resolve() == pdf_path.resolve()
+                and self.source_file.get()
+                and Path(self.source_file.get()).resolve() == pdf_path.resolve()
+                and pdf_path.is_file()
+                and (getattr(self, 'loaded_file_identity', None) is None
+                     or self.loaded_file_identity == file_identity(pdf_path))):
+            return
         self.source_file.set(str(pdf_path))
         self.load_pdf(pdf_path)
         self.auto_save_work_state()
 
     def refresh_suggestions(self) -> None:
+        started = time.perf_counter()
         query = self.address_query.get()
         self.current_suggestions = search_legal_dongs(query, self.legal_dongs)
+        self.performance.record('search', time.perf_counter() - started)
         self.suggestion_list.delete(0, tk.END)
         for dong in self.current_suggestions:
             self.suggestion_list.insert(tk.END, f"{dong.code}  {dong.name}")
@@ -1114,6 +1233,15 @@ class FileMakerApp(tk.Tk):
 
     def close_pdf_doc(self) -> None:
         self.cancel_ocr()
+        self.load_generation += 1
+        self.render_request = None
+        self.pending_region_read = None
+        if self.prefetch_after_id is not None:
+            self.after_cancel(self.prefetch_after_id)
+            self.prefetch_after_id = None
+        if self.resize_after_id is not None:
+            self.after_cancel(self.resize_after_id)
+            self.resize_after_id = None
         if self.current_pdf_doc is not None:
             try:
                 self.current_pdf_doc.close()
@@ -1138,6 +1266,8 @@ class FileMakerApp(tk.Tk):
             return
         try:
             self.close_pdf_doc()
+            self.load_started = time.perf_counter()
+            self.loaded_file_identity = file_identity(path)
             self.current_pdf_doc = fitz.open(path)
             page_count = len(self.current_pdf_doc)
             if page_count == 0:
@@ -1146,12 +1276,16 @@ class FileMakerApp(tk.Tk):
             target = self.address_region.page_index if self.address_region else 0
             page_index = target if target < page_count else 0
             self.pdf_state = PdfRenderState(path=path, page_index=page_index, page_count=page_count, zoom=1.0, fit_to_width=True)
+            self.rendered_page_index = None
+            self.current_pdf_image = None
+            self.pdf_canvas.delete('all')
+            if self.address_region and target < page_count:
+                self.pending_region_read = (self.load_generation, page_index,
+                                            self.address_region, self.address_query.get())
             self.render_pdf_page()
             if self.address_region:
                 if target >= page_count:
                     self.region_status.set(f"지정한 {target + 1}페이지가 없습니다. 첫 페이지에서 영역을 새로 지정하세요.")
-                else:
-                    self.read_address_region()
         except Exception as exc:
             self.clear_pdf_viewer(f"PDF를 열 수 없습니다.\n{exc}")
 
@@ -1160,29 +1294,100 @@ class FileMakerApp(tk.Tk):
         if fitz is None or self.current_pdf_doc is None or self.pdf_state.path is None:
             return
         try:
-            page = self.current_pdf_doc.load_page(self.pdf_state.page_index)
-            zoom = self.pdf_state.zoom
-            if self.pdf_state.fit_to_width:
-                canvas_width = max(self.pdf_canvas.winfo_width() - 24, 200)
-                page_width = float(page.rect.width) or 1.0
-                zoom = max(canvas_width / page_width, 0.25)
-            matrix = fitz.Matrix(zoom, zoom)
-            pixmap = page.get_pixmap(matrix=matrix, alpha=False)
-            self.current_pdf_image = tk.PhotoImage(data=pixmap.tobytes("ppm"))
+            width = max(self.pdf_canvas.winfo_width() - 24, 200) if self.pdf_state.fit_to_width else 0
+            key = render_key(self.pdf_state.path, self.pdf_state.page_index,
+                             1.0 if width else self.pdf_state.zoom, width)
+            request = (key, self.load_generation, self.pdf_state.page_index)
+            self.render_request = request
+            self.rendered_page_index = None
+            self.pdf_status.set('PDF 표시 준비 중…')
+            cached = self.pipeline.request_render(key)
+            if cached is not None:
+                self.performance.record('render_cache_hit', 0)
+                self.apply_rendered_page(request, cached)
+            self.ensure_pipeline_poll()
+        except Exception as exc:
+            self.clear_pdf_viewer(f"PDF 페이지를 표시할 수 없습니다.\n{exc}")
+
+    def apply_rendered_page(self, request, rendered) -> None:
+        if request != self.render_request or request[1] != self.load_generation:
+            return
+        key, _, page_index = request
+        try:
+            if self.pdf_state.path is None:
+                return
+            if key[1] != file_identity(self.pdf_state.path):
+                self.pdf_status.set('PDF 파일이 변경됐습니다. 목록에서 다시 선택하세요.')
+                return
+            self.current_pdf_image = tk.PhotoImage(data=rendered.ppm)
             self.pdf_canvas.delete("all")
             self.pdf_canvas.create_image(10, 10, image=self.current_pdf_image, anchor=tk.NW)
-            self.render_zoom = zoom
-            self.rendered_page_index = self.pdf_state.page_index
+            self.render_zoom = rendered.zoom
+            self.rendered_page_index = page_index
             self.draw_address_region()
-            width = self.current_pdf_image.width() + 20
-            height = self.current_pdf_image.height() + 20
+            width, height = rendered.width + 20, rendered.height + 20
             self.pdf_canvas.configure(scrollregion=(0, 0, width, height))
             if self.region_keyboard_edit:
                 self.ensure_region_visible()
-            mode = "폭 맞춤" if self.pdf_state.fit_to_width else f"{int(self.pdf_state.zoom * 100)}%"
+            mode = "폭 맞춤" if self.pdf_state.fit_to_width else f"{int(self.render_zoom * 100)}%"
+            if not self.pdf_state.fit_to_width and self.render_zoom < self.pdf_state.zoom - .001:
+                mode += ' · 큰 도면 해상도 상한'
             self.pdf_status.set(f"{self.pdf_state.page_index + 1}/{self.pdf_state.page_count} 페이지 · {mode}")
+            self.performance.record('render_worker', rendered.seconds)
+            if self.load_started is not None:
+                self.performance.record('file_to_display', time.perf_counter() - self.load_started)
+                self.load_started = None
+            pending, self.pending_region_read = self.pending_region_read, None
+            if pending == (self.load_generation, page_index, self.address_region, self.address_query.get()):
+                self.read_address_region()
+            self.schedule_prefetch()
         except Exception as exc:
             self.clear_pdf_viewer(f"PDF 페이지를 표시할 수 없습니다.\n{exc}")
+
+    def ensure_pipeline_poll(self):
+        if self.pipeline_poll_id is None:
+            self.pipeline_poll_id = self.after(25, self.poll_pipeline)
+
+    def poll_pipeline(self):
+        self.pipeline_poll_id = None
+        for key, value, error in self.pipeline.poll(include_prepare=not isinstance(self.ocr_job, PreparedOcrJob)):
+            if key[0] == 'render' and self.render_request and key == self.render_request[0]:
+                if error:
+                    self.clear_pdf_viewer(f'PDF 표시 실패: {error}')
+                else:
+                    self.apply_rendered_page(self.render_request, value)
+        if self.pipeline.render.key is not None or self.pipeline.prepare.key is not None:
+            self.ensure_pipeline_poll()
+
+    def schedule_prefetch(self):
+        if self.prefetch_after_id is not None:
+            self.after_cancel(self.prefetch_after_id)
+        self.prefetch_after_id = self.after(150, self.prefetch_next_source)
+
+    def prefetch_next_source(self):
+        self.prefetch_after_id = None
+        if (self.copy_busy or self.ocr_job is not None or self.pdf_state.path is None
+                or self.rendered_page_index != self.pdf_state.page_index
+                or self.region_drag or self.region_keyboard_edit):
+            return
+        files = self.source_pdf_files
+        current = next((i for i, p in enumerate(files) if p.resolve() == self.pdf_state.path.resolve()), None)
+        if current is None:
+            return
+        ordered = files[current+1:] + files[:current]
+        candidate = next((p for p in ordered if p.resolve() not in self.processed_sources and p.is_file()), None)
+        if candidate is None:
+            return
+        try:
+            page = self.address_region.page_index if self.address_region else 0
+            width = max(self.pdf_canvas.winfo_width() - 24, 200)
+            self.pipeline.request_render(render_key(candidate, page, 1.0, width))
+            if self.address_region is not None:
+                self.pipeline.request_region(region_key(candidate, page, self.address_region.bounds))
+            self.ensure_pipeline_poll()
+        except (OSError, RuntimeError):
+            # Speculation never interrupts current work or opens a dialog.
+            pass
 
     def region_page(self):
         if self.current_pdf_doc is None or self.rendered_page_index != self.pdf_state.page_index:
@@ -1415,13 +1620,19 @@ class FileMakerApp(tk.Tk):
         self.cancel_ocr()
         self.last_ocr_text = ''
         try:
-            text = '' if force_ocr else extract_region_text(page, self.address_region.bounds)
+            started = time.perf_counter()
+            cached = self.pipeline.regions.get(region_key(self.pdf_state.path, self.address_region.page_index,
+                                                         self.address_region.bounds))
+            text = '' if force_ocr else (cached.text if cached and not cached.ocr
+                                         else extract_region_text(page, self.address_region.bounds))
+            self.performance.record('text_extract', time.perf_counter() - started)
             if not text:
                 self.start_region_ocr(force_ocr)
                 return
             self.address_query.set(text)
             self.refresh_suggestions()
             self.region_status.set("주소 입력·검색 완료 · 영역 내부 드래그: 이동 / 모서리: 크기 조절")
+            self.schedule_prefetch()
         except Exception as exc:
             self.region_status.set(f"텍스트 추출 실패: {exc} · 직접 입력할 수 있습니다.")
 
@@ -1430,10 +1641,23 @@ class FileMakerApp(tk.Tk):
             path = self.pdf_state.path.resolve()
             region = self.address_region
             self.ocr_context = (path, region, self.address_query.get())
-            self.ocr_job = OcrJob(path, region.page_index, region.bounds)
+            self.ocr_started = time.perf_counter()
+            key = region_key(path, region.page_index, region.bounds)
+            self.ocr_file_identity = key[1]
+            cached = self.pipeline.regions.get(key)
+            if not forced and (cached is not None or self.pipeline.prepare.key == key):
+                self.ocr_job = PreparedOcrJob(self.pipeline, key)
+                self.performance.record('ocr_prefetch_hit', 0)
+            else:
+                if self.pipeline.prepare.key is not None:
+                    self.pipeline.prepare.close()
+                self.ocr_job = OcrJob(path, region.page_index, region.bounds)
             prefix = '' if forced else '영역에 추출 가능한 텍스트가 없습니다. '
             self.region_status.set(prefix + "OCR 인식 중… Esc: 취소 / 결과 확인 후 복사하세요.")
-            self.ocr_poll_id = self.after(80, self.poll_region_ocr)
+            if cached is not None and not forced:
+                self.poll_region_ocr()
+            else:
+                self.ocr_poll_id = self.after(80, self.poll_region_ocr)
         except Exception as exc:
             self.cancel_ocr()
             self.region_status.set(f"OCR 시작 실패: {exc} · 직접 입력할 수 있습니다.")
@@ -1455,7 +1679,15 @@ class FileMakerApp(tk.Tk):
         context = self.ocr_context
         self.ocr_job = None
         self.ocr_context = None
+        self.performance.record('ocr_wait', time.perf_counter() - self.ocr_started)
+        self.performance.record('ocr_worker', result.seconds)
+        self.schedule_prefetch()
         path, region, query = context
+        try:
+            if file_identity(path) != self.ocr_file_identity:
+                return
+        except OSError:
+            return
         if (self.pdf_state.path is None or self.pdf_state.path.resolve() != path
                 or self.address_region != region or self.pdf_state.page_index != region.page_index
                 or self.address_query.get() != query):
@@ -1493,11 +1725,28 @@ class FileMakerApp(tk.Tk):
             self.operation_status.set("복사 완료 후 앱을 종료합니다…")
             return
         self.cancel_ocr()
+        for attribute in ('pipeline_poll_id', 'resize_after_id', 'prefetch_after_id'):
+            pending = getattr(self, attribute)
+            if pending is not None:
+                self.after_cancel(pending)
+                setattr(self, attribute, None)
+        self.pipeline.close()
+        if self.performance_report:
+            try:
+                self.performance.write(self.performance_report)
+            except OSError as exc:
+                print(f'성능 보고서 저장 실패: {exc}', file=sys.stderr)
         super().destroy()
 
     def on_pdf_canvas_resize(self, _event: tk.Event) -> None:
         if self.pdf_state.fit_to_width and self.current_pdf_doc is not None:
-            self.after_idle(self.render_pdf_page)
+            if self.resize_after_id is not None:
+                self.after_cancel(self.resize_after_id)
+            self.resize_after_id = self.after(120, self.render_after_resize)
+
+    def render_after_resize(self):
+        self.resize_after_id = None
+        self.render_pdf_page()
 
     def on_pdf_mouse_wheel(self, event: tk.Event) -> str:
         if not self.current_pdf_doc:
@@ -1591,7 +1840,15 @@ class FileMakerApp(tk.Tk):
         output = Path(self.output_folder.get()) if self.output_folder.get() else Path()
         pnu = make_pnu(self.selected_dong.code, lot)
         full_address = f"{self.selected_dong.name} {lot.display}"
-        filename = build_destination_path(source, output, self.year.get(), self.doc_type.get(), pnu, full_address)
+        key = (source.suffix, output, self.year.get(), self.doc_type.get(), pnu, full_address)
+        cached = self.preview_destination_cache
+        if cached is not None and cached[0] == key and time.monotonic() - cached[1] < .5:
+            filename = cached[2]
+        else:
+            started = time.perf_counter()
+            filename = build_destination_path(source, output, self.year.get(), self.doc_type.get(), pnu, full_address)
+            self.preview_destination_cache = key, time.monotonic(), filename
+            self.performance.record('filename_preview', time.perf_counter() - started)
         return pnu, full_address, filename
 
     def update_preview(self) -> None:
@@ -1662,6 +1919,10 @@ class FileMakerApp(tk.Tk):
     def copy_file(self) -> None:
         if self.copy_busy:
             return
+        if (getattr(self, 'render_request', None) is not None
+                and self.rendered_page_index != self.pdf_state.page_index):
+            self.operation_status.set('PDF 표시 준비 중입니다. 완료 후 복사하세요.')
+            return
         if self.ocr_job is not None:
             self.region_status.set("OCR 인식 중입니다. 완료 후 복사하세요. Esc: 취소")
             return
@@ -1676,6 +1937,7 @@ class FileMakerApp(tk.Tk):
         if not self.confirm_destination_collision(plan):
             return
         self.copy_busy = True
+        self.copy_started = time.perf_counter()
         self.copy_source = source
         self.copy_plan = plan
         self.copy_auto_next = self.auto_next.get()
@@ -1694,6 +1956,7 @@ class FileMakerApp(tk.Tk):
 
     def set_copy_busy_ui(self, busy: bool) -> None:
         if busy:
+            self.source_mouse_path = None
             self.hide_tooltips()
             self.copy_disabled_widgets = []
             for widget in self.app_widgets():
@@ -1732,6 +1995,7 @@ class FileMakerApp(tk.Tk):
 
     def finish_copy(self, error: Exception | None = None) -> None:
         source, destination = self.copy_source, self.copy_plan.destination
+        self.performance.record('copy_wait', time.perf_counter() - self.copy_started)
         # Restore list widgets before repopulating them; disabled Listboxes
         # ignore programmatic insert/delete and selection changes.
         self.set_copy_busy_ui(False)
@@ -1742,8 +2006,7 @@ class FileMakerApp(tk.Tk):
                 return
             self.processed_sources.add(source.resolve())
             self.auto_save_work_state()
-            self.refresh_source_list(load_state=False)
-            self.restore_source_selection(source)
+            self.update_processed_source_row(source)
             self.refresh_output_list(destination)
             self.update_preview()
             self.last_copy_destination = destination
@@ -1775,7 +2038,12 @@ class FileMakerApp(tk.Tk):
 
 
 def main() -> None:
+    import argparse
+    parser = argparse.ArgumentParser(description=APP_TITLE)
+    parser.add_argument('--performance-report', help='종료할 때 수치만 포함한 성능 JSON 저장')
+    args = parser.parse_args()
     app = FileMakerApp()
+    app.performance_report = args.performance_report
     app.mainloop()
 
 
@@ -1783,6 +2051,9 @@ if __name__ == "__main__":
     multiprocessing.freeze_support()
     if len(sys.argv) > 1 and sys.argv[1] == '--ocr-check':
         from ocr_engine import check_cli
+        raise SystemExit(check_cli(sys.argv[2:]))
+    if len(sys.argv) > 1 and sys.argv[1] == '--pipeline-check':
+        from pdf_pipeline import check_cli
         raise SystemExit(check_cli(sys.argv[2:]))
     main()
 
