@@ -107,7 +107,8 @@ def run(app_class, output):
                     assert source.resolve() in root.processed_sources
                     assert not root.survey_ledger
                     result.clear()
-                    result.update(phase='passed', copies=len(outputs))
+                    from ppocr_engine import HEADER_ENGINE
+                    result.update(phase='passed', copies=len(outputs), header_engine=HEADER_ENGINE)
                     write_report(path,result)
                     root.destroy()
                     return

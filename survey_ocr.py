@@ -98,7 +98,7 @@ def _ocr(pix, models):
 def read_survey(path, header_region, lot_region):
     import pymupdf
     from ocr_engine import MODEL_ROOT
-    from pdf_region import extract_region_text
+    from ppocr_engine import recognize_header
     started = time.perf_counter()
     header_region, lot_region = validate_region(header_region), validate_region(lot_region)
     with pymupdf.open(path) as doc:
@@ -106,10 +106,8 @@ def read_survey(path, header_region, lot_region):
             raise ValueError('암호가 필요한 PDF입니다.')
         if header_region[0] >= len(doc):
             raise ValueError('토지소재 페이지가 없습니다. 영역을 다시 지정하세요.')
-        header = extract_region_text(doc[header_region[0]], header_region[1])
-        if not header:
-            with _ocr(_region_pixmap(doc, header_region, 300), MODEL_ROOT) as recognized:
-                header = recognized[0].get_text('text', sort=True).strip()
+        # Always read the image: existing/hidden PDF text may already be incorrect.
+        header = recognize_header(_region_pixmap(doc, header_region, 300))
         # Render even PDFs with text layers: hidden OCR text has no reliable color.
         original = _region_pixmap(doc, lot_region, 450)
         masked, ambiguous, red = neutral_mask(original)

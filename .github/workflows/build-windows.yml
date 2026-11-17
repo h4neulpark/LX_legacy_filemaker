@@ -36,7 +36,7 @@ jobs:
         run: python -m pip install -r requirements-dev.txt
 
       - name: Run tests and Windows selection event checks
-        run: python -m unittest test_app test_copy test_copy_scaling test_workspace_index test_source_selection test_async_viewer test_pdf_pipeline test_survey_batch test_survey_workflow test_survey_ocr test_survey_gui test_pdf_region.RegionGeometryTests test_ocr.OcrEngineTests
+        run: python -m unittest test_app test_copy test_copy_scaling test_workspace_index test_source_selection test_async_viewer test_pdf_pipeline test_survey_batch test_survey_workflow test_survey_ocr test_survey_gui test_ppocr_engine test_pdf_region.RegionGeometryTests test_ocr.OcrEngineTests
 
       - name: Build standalone EXE
         run: python -m PyInstaller --noconfirm --clean '법정동PNU파일복사도구.spec'
@@ -84,6 +84,7 @@ jobs:
           if (-not $process.WaitForExit(60000)) { throw 'Survey GUI copy check timed out' }
           $result = Get-Content -Raw -Encoding utf8 $report | ConvertFrom-Json
           $result | ConvertTo-Json -Depth 4
+          if ($result.header_engine -notlike 'ppocrv5-korean-*') { throw 'PP-OCRv5 header check did not complete' }
           if ($null -ne $process.ExitCode -and $process.ExitCode -ne 0) { throw "Survey GUI copy check failed ($($process.ExitCode)): $($result.error)" }
           if ($result.phase -ne 'passed' -or $result.copies -ne 3) { throw 'Survey batch output invalid' }
 

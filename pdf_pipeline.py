@@ -23,7 +23,8 @@ def region_key(path, page, bounds):
 
 
 def survey_key(path, header, lots):
-    return ('survey', file_identity(path), header, lots)
+    from ppocr_engine import HEADER_ENGINE
+    return ('survey', file_identity(path), header, lots, HEADER_ENGINE)
 
 
 @dataclass(frozen=True)
@@ -226,7 +227,7 @@ class PdfPipeline:
     def request_survey(self, key):
         cached = self.regions.get(key)
         if cached is None:
-            _, identity, header, lots = key
+            _, identity, header, lots, _engine = key
             self.prepare.submit(key, 'survey', (identity[0], header, lots))
         return cached
 
