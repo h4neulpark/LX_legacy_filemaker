@@ -1550,6 +1550,9 @@ class FileMakerApp(SurveyWorkflow, tk.Tk):
                 or self.rendered_page_index != self.pdf_state.page_index
                 or self.region_drag or self.region_keyboard_edit):
             return
+        if self.is_survey() and (self.survey_reading or self.survey_edit_target is not None
+                                 or self.survey_drag is not None):
+            return
         candidate = self.source_index.next_pending(self.pdf_state.path, self.processed_sources)
         if candidate is None or candidate == self.pdf_state.path or not candidate.is_file():
             return

@@ -100,6 +100,21 @@ class AsyncViewerTests(unittest.TestCase):
         self.ui.load_pdf.assert_not_called()
         self.ui.source_file.set.assert_not_called()
 
+    def test_prefetch_cannot_replace_current_survey_read_or_region_selection(self):
+        self.ui.is_survey.return_value=True
+        self.ui.rendered_page_index=0
+        self.ui.copy_busy=False
+        self.ui.ocr_job=None
+        self.ui.region_drag=None
+        self.ui.source_index=Mock()
+        for reading,target,drag in ((True,None,None),(False,'lots',None),(False,None,object())):
+            with self.subTest(reading=reading,target=target):
+                self.ui.survey_reading=reading
+                self.ui.survey_edit_target=target
+                self.ui.survey_drag=drag
+                app.FileMakerApp.prefetch_next_source(self.ui)
+        self.ui.source_index.next_pending.assert_not_called()
+
     def test_cached_filename_preview_does_not_replace_fresh_collision_check(self):
         ui = SimpleNamespace(selected_dong=app.LegalDong('1168010100', '서울 강남구 역삼동',
                                                        '서울강남구역삼동', ('서울', '강남구', '역삼동')),
