@@ -1,4 +1,5 @@
 import tempfile
+import time
 import tkinter as tk
 import unittest
 from pathlib import Path
@@ -43,6 +44,13 @@ class RegionGeometryTests(unittest.TestCase):
 
 
 class RegionGuiTests(unittest.TestCase):
+    def wait_for_copy(self):
+        deadline = time.monotonic() + 5
+        while self.root.copy_busy and time.monotonic() < deadline:
+            self.root.update()
+            time.sleep(.01)
+        self.assertFalse(self.root.copy_busy, 'Copy did not finish')
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)

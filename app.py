@@ -9,6 +9,7 @@ import re
 import shutil
 import sys
 import tkinter as tk
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -422,6 +423,11 @@ class FileMakerApp(tk.Tk):
         self.ocr_poll_id = None
         self.ocr_context = None
         self.last_ocr_text = ''
+        self.copy_future = None
+        self.copy_poll_id = None
+        self.copy_busy = False
+        self.close_after_copy = False
+        self.copy_disabled_widgets = []
 
         self.code_file = tk.StringVar(value=str(DEFAULT_CODE_FILE))
         self.source_folder = tk.StringVar()
@@ -605,9 +611,13 @@ class FileMakerApp(tk.Tk):
         copy_panel = ttk.Frame(parent)
         copy_panel.grid(row=10, column=0, sticky=tk.EW, pady=(0, 8))
         copy_panel.columnconfigure(0, weight=1)
-        ttk.Button(copy_panel, text="복사 (Ctrl+Enter)", command=self.copy_file).grid(row=0, column=0, sticky=tk.EW)
-        ttk.Checkbutton(copy_panel, text="복사 후 다음 미처리 파일로 이동", variable=self.auto_next).grid(row=1, column=0, sticky=tk.W, pady=(4, 0))
-        ttk.Label(copy_panel, textvariable=self.operation_status, wraplength=330).grid(row=2, column=0, sticky=tk.W, pady=(4, 0))
+        self.copy_button = ttk.Button(copy_panel, text="복사 (Ctrl+Enter)", command=self.copy_file)
+        self.copy_button.grid(row=0, column=0, sticky=tk.EW)
+        self.copy_progress = ttk.Progressbar(copy_panel, mode="indeterminate")
+        self.copy_progress.grid(row=1, column=0, sticky=tk.EW, pady=(4, 0))
+        self.copy_progress.grid_remove()
+        ttk.Checkbutton(copy_panel, text="복사 후 다음 미처리 파일로 이동", variable=self.auto_next).grid(row=2, column=0, sticky=tk.W, pady=(4, 0))
+        ttk.Label(copy_panel, textvariable=self.operation_status, wraplength=330).grid(row=3, column=0, sticky=tk.W, pady=(4, 0))
 
         output_heading = ttk.Frame(parent)
         output_heading.grid(row=11, column=0, sticky=tk.EW, pady=(0, 4))
@@ -677,10 +687,20 @@ class FileMakerApp(tk.Tk):
             })
         for sequence, handler in shortcut_bindings.items():
             def dispatch(event, action=handler):
+                if self.copy_busy:
+                    return "break"
                 self.hide_tooltips()
                 return action(event)
             self.bind_class(self.shortcut_tag, sequence, dispatch)
-        self.bind_class(self.shortcut_tag, "<KeyPress>", self.hide_tooltips)
+        def block_during_copy(event):
+            if self.copy_busy:
+                return "break"
+            if event.type == tk.EventType.KeyPress:
+                self.hide_tooltips()
+
+        for sequence in ("<KeyPress>", "<ButtonPress>", "<ButtonRelease>",
+                         "<Motion>", "<MouseWheel>"):
+            self.bind_class(self.shortcut_tag, sequence, block_during_copy)
 
         # Run application shortcuts before widget/class handlers. Native dialogs
         # and tooltip windows are deliberately outside this widget tree.
@@ -1468,6 +1488,10 @@ class FileMakerApp(tk.Tk):
         self.ocr_context = None
 
     def destroy(self):
+        if self.copy_busy:
+            self.close_after_copy = True
+            self.operation_status.set("복사 완료 후 앱을 종료합니다…")
+            return
         self.cancel_ocr()
         super().destroy()
 
@@ -1636,6 +1660,8 @@ class FileMakerApp(tk.Tk):
         )
 
     def copy_file(self) -> None:
+        if self.copy_busy:
+            return
         if self.ocr_job is not None:
             self.region_status.set("OCR 인식 중입니다. 완료 후 복사하세요. Esc: 취소")
             return
@@ -1649,23 +1675,86 @@ class FileMakerApp(tk.Tk):
         plan = build_destination_plan(source, output, self.year.get(), self.doc_type.get(), pnu, full_address)
         if not self.confirm_destination_collision(plan):
             return
-        destination = plan.destination
+        self.copy_busy = True
+        self.copy_source = source
+        self.copy_plan = plan
+        self.copy_auto_next = self.auto_next.get()
+        self.set_copy_busy_ui(True)
+        self.operation_status.set("복사 중…")
         try:
-            copy_with_destination_plan(source, plan)
+            executor = ThreadPoolExecutor(max_workers=1)
+            try:
+                self.copy_future = executor.submit(copy_with_destination_plan, source, plan)
+            finally:
+                executor.shutdown(wait=False)
         except Exception as exc:
-            messagebox.showerror("복사 실패", f"파일을 복사하지 못했습니다.\n\n{exc}")
+            self.finish_copy(exc)
             return
+        self.copy_poll_id = self.after(50, self.poll_copy)
 
-        self.processed_sources.add(source.resolve())
-        self.auto_save_work_state()
-        self.refresh_source_list(load_state=False)
-        self.restore_source_selection(source)
-        self.refresh_output_list(destination)
-        self.update_preview()
-        self.last_copy_destination = destination
-        self.operation_status.set("복사 완료 · 현재 파일을 유지합니다.")
-        if self.auto_next.get():
-            self.open_next_unprocessed(source)
+    def set_copy_busy_ui(self, busy: bool) -> None:
+        if busy:
+            self.hide_tooltips()
+            self.copy_disabled_widgets = []
+            for widget in self.app_widgets():
+                if isinstance(widget, (ttk.Button, ttk.Entry, ttk.Combobox, ttk.Checkbutton)):
+                    if not widget.instate(["disabled"]):
+                        widget.state(["disabled"])
+                        self.copy_disabled_widgets.append(widget)
+                elif isinstance(widget, tk.Listbox) and widget.cget("state") != tk.DISABLED:
+                    widget.configure(state=tk.DISABLED)
+                    self.copy_disabled_widgets.append(widget)
+            self.copy_button.configure(text="복사 중…")
+            self.copy_progress.grid()
+            self.copy_progress.start(15)
+        else:
+            self.copy_progress.stop()
+            self.copy_progress.grid_remove()
+            self.copy_button.configure(text="복사 (Ctrl+Enter)")
+            for widget in self.copy_disabled_widgets:
+                if isinstance(widget, tk.Listbox):
+                    widget.configure(state=tk.NORMAL)
+                else:
+                    widget.state(["!disabled"])
+            self.copy_disabled_widgets = []
+
+    def poll_copy(self) -> None:
+        self.copy_poll_id = None
+        if not self.copy_future.done():
+            self.copy_poll_id = self.after(50, self.poll_copy)
+            return
+        try:
+            self.copy_future.result()
+        except Exception as exc:
+            self.finish_copy(exc)
+        else:
+            self.finish_copy()
+
+    def finish_copy(self, error: Exception | None = None) -> None:
+        source, destination = self.copy_source, self.copy_plan.destination
+        # Restore list widgets before repopulating them; disabled Listboxes
+        # ignore programmatic insert/delete and selection changes.
+        self.set_copy_busy_ui(False)
+        try:
+            if error is not None:
+                self.operation_status.set("복사 실패 · 오류를 확인하고 다시 시도하세요.")
+                messagebox.showerror("복사 실패", f"파일을 복사하지 못했습니다.\n\n{error}")
+                return
+            self.processed_sources.add(source.resolve())
+            self.auto_save_work_state()
+            self.refresh_source_list(load_state=False)
+            self.restore_source_selection(source)
+            self.refresh_output_list(destination)
+            self.update_preview()
+            self.last_copy_destination = destination
+            self.operation_status.set("복사 완료 · 현재 파일을 유지합니다.")
+            if self.copy_auto_next and not self.close_after_copy:
+                self.open_next_unprocessed(source)
+        finally:
+            self.copy_future = None
+            self.copy_busy = False
+            if self.close_after_copy:
+                self.destroy()
 
     def open_next_unprocessed(self, source):
         files = self.source_pdf_files

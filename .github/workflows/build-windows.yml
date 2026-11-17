@@ -36,7 +36,7 @@ jobs:
         run: python -m pip install -r requirements-dev.txt
 
       - name: Run tests without desktop interaction
-        run: python -m unittest test_app test_pdf_region.RegionGeometryTests test_ocr.OcrEngineTests
+        run: python -m unittest test_app test_copy test_pdf_region.RegionGeometryTests test_ocr.OcrEngineTests
 
       - name: Build standalone EXE
         run: python -m PyInstaller --noconfirm --clean '법정동PNU파일복사도구.spec'

@@ -68,6 +68,7 @@ class OcrGuiTests(unittest.TestCase):
     make_pdf = region_tests.RegionGuiTests.make_pdf
     event = region_tests.RegionGuiTests.event
     select_address = region_tests.RegionGuiTests.select_address
+    wait_for_copy = region_tests.RegionGuiTests.wait_for_copy
 
     def select_blank_region(self):
         self.root.address_region = AddressRegion(0, (.8, .8, 1, 1))
@@ -174,6 +175,7 @@ class OcrGuiTests(unittest.TestCase):
                                 address=self.root.address_query.get(), pnu=self.root.pnu_preview.get(),
                                 status=self.root.region_status.get(), source_unchanged=True)
             self.root.copy_file()
+            self.wait_for_copy()
             outputs = list(output_folder.glob(f'*{pnu}*.pdf'))
             self.assertEqual(len(outputs), 1)
             self.assertEqual(hashlib.sha256(outputs[0].read_bytes()).hexdigest(), original_digest)

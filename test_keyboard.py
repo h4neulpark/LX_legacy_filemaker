@@ -1,6 +1,8 @@
 import tkinter as tk
+import threading
 import unittest
 from pathlib import Path
+from tkinter import ttk
 from unittest.mock import patch
 
 import test_pdf_region as region_tests
@@ -11,6 +13,7 @@ class KeyboardWorkflowTests(unittest.TestCase):
     make_pdf = region_tests.RegionGuiTests.make_pdf
     event = region_tests.RegionGuiTests.event
     select_address = region_tests.RegionGuiTests.select_address
+    wait_for_copy = region_tests.RegionGuiTests.wait_for_copy
 
     def focus(self, widget):
         self.root.deiconify()
@@ -172,9 +175,11 @@ class KeyboardWorkflowTests(unittest.TestCase):
         self.root.processed_sources.add(three.resolve())
         with patch('app.messagebox.showinfo') as success:
             self.root.copy_file()
+            self.wait_for_copy()
             self.assertEqual(Path(self.root.source_file.get()).name, 'two.pdf')
             self.assertEqual(len(list(output.glob('*.pdf'))), 1)
             self.root.copy_file()
+            self.wait_for_copy()
             self.assertEqual(Path(self.root.source_file.get()).name, 'two.pdf')
             self.assertIn('모든 PDF', self.root.operation_status.get())
             success.assert_not_called()
@@ -182,6 +187,43 @@ class KeyboardWorkflowTests(unittest.TestCase):
         self.root.processed_sources.discard(self.pdf.resolve())
         self.root.open_next_unprocessed(Path(self.tmp.name) / 'two.pdf')
         self.assertEqual(Path(self.root.source_file.get()).name, 'one.pdf')
+
+    def test_copy_progress_and_controls_recover_after_slow_copy(self):
+        self.workspace()
+        self.select_address()
+        output = Path(self.tmp.name) / 'output'
+        output.mkdir()
+        self.root.output_folder.set(str(output))
+        self.focus(self.root.address_entry)
+        started, release = threading.Event(), threading.Event()
+
+        def slow_copy(*_args):
+            started.set()
+            if not release.wait(5):
+                raise TimeoutError('Copy test timed out')
+
+        with patch('app.copy_with_destination_plan', side_effect=slow_copy) as copy:
+            try:
+                self.root.copy_file()
+                self.assertTrue(started.wait(2))
+                self.root.update()
+                self.assertTrue(self.root.copy_progress.winfo_ismapped())
+                self.assertTrue(self.root.copy_button.instate(['disabled']))
+                self.assertTrue(self.root.address_entry.instate(['disabled']))
+                self.assertTrue(self.root.copy_busy)
+                self.press('<Control-Return>')
+                self.root.address_entry.event_generate('<ButtonPress-4>')
+                self.root.address_entry.event_generate('<ButtonPress-5>')
+                self.root.copy_file()
+                copy.assert_called_once()
+            finally:
+                release.set()
+                self.wait_for_copy()
+        self.assertFalse(self.root.copy_progress.winfo_ismapped())
+        self.assertFalse(self.root.copy_button.instate(['disabled']))
+        self.assertFalse(self.root.address_entry.instate(['disabled']))
+        readonly_combos = [w for w in self.root.app_widgets() if isinstance(w, ttk.Combobox)]
+        self.assertTrue(all(w.instate(['readonly', '!disabled']) for w in readonly_combos))
 
     def test_copy_stays_when_option_off_and_failure_does_not_advance(self):
         self.workspace()
@@ -191,6 +233,7 @@ class KeyboardWorkflowTests(unittest.TestCase):
         self.root.output_folder.set(str(output))
         self.root.auto_next.set(False)
         self.root.copy_file()
+        self.wait_for_copy()
         self.assertEqual(Path(self.root.source_file.get()).name, 'one.pdf')
         self.root.auto_next.set(True)
         self.root.processed_sources.clear()
@@ -198,6 +241,7 @@ class KeyboardWorkflowTests(unittest.TestCase):
              patch('app.messagebox.showerror') as error, \
              patch.object(self.root, 'confirm_destination_collision', return_value=True):
             self.root.copy_file()
+            self.wait_for_copy()
             error.assert_called_once()
         self.assertEqual(Path(self.root.source_file.get()).name, 'one.pdf')
         self.assertFalse(self.root.processed_sources)
