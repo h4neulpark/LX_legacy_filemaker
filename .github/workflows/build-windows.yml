@@ -63,6 +63,7 @@ jobs:
           $exe = Get-Item 'dist/법정동PNU파일복사도구_v*.exe'
           $report = 'build/survey-ui-check.json'
           $process = Start-Process -FilePath $exe.FullName -WorkingDirectory $PWD.Path -ArgumentList @('--survey-ui-check', '--output', $report) -PassThru
+          $processHandle = $process.Handle
           $deadline = (Get-Date).AddSeconds(60)
           while (-not (Test-Path $report)) {
             if ($process.HasExited -or (Get-Date) -gt $deadline) { throw 'Survey GUI did not become ready' }
@@ -81,16 +82,19 @@ jobs:
           } catch { Write-Host "Preview capture unavailable: $_" }
           New-Item -ItemType File -Path 'build/survey-ui-check.release' -Force | Out-Null
           if (-not $process.WaitForExit(60000)) { throw 'Survey GUI copy check timed out' }
-          if ($process.ExitCode -ne 0) { throw 'Survey GUI copy check failed' }
           $result = Get-Content -Raw -Encoding utf8 $report | ConvertFrom-Json
+          $result | ConvertTo-Json -Depth 4
+          if ($null -ne $process.ExitCode -and $process.ExitCode -ne 0) { throw "Survey GUI copy check failed ($($process.ExitCode)): $($result.error)" }
           if ($result.phase -ne 'passed' -or $result.copies -ne 3) { throw 'Survey batch output invalid' }
-          $result | ConvertTo-Json
 
       - name: Upload survey UI preview
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: survey-ui-preview
-          path: build/survey-ui.png
+          path: |
+            build/survey-ui.png
+            build/survey-ui-check.json
           if-no-files-found: ignore
           retention-days: 30
 

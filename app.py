@@ -1886,7 +1886,7 @@ class FileMakerApp(SurveyWorkflow, tk.Tk):
             self.close_after_copy = True
             self.operation_status.set("복사 완료 후 앱을 종료합니다…")
             return
-        self.cancel_ocr()
+        self.close_pdf_doc()
         self.cancel_survey_read()
         for attribute in ('pipeline_poll_id', 'resize_after_id', 'prefetch_after_id'):
             pending = getattr(self, attribute)
