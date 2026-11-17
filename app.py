@@ -1972,6 +1972,7 @@ class FileMakerApp(SurveyWorkflow, tk.Tk):
         self.cancel_region_keyboard()
         if not self.current_pdf_doc or self.pdf_state.page_index <= 0:
             return
+        self.prepare_survey_page_change()
         self.pdf_state = PdfRenderState(
             path=self.pdf_state.path,
             page_index=self.pdf_state.page_index - 1,
@@ -1986,6 +1987,7 @@ class FileMakerApp(SurveyWorkflow, tk.Tk):
         self.cancel_region_keyboard()
         if not self.current_pdf_doc or self.pdf_state.page_index >= self.pdf_state.page_count - 1:
             return
+        self.prepare_survey_page_change()
         self.pdf_state = PdfRenderState(
             path=self.pdf_state.path,
             page_index=self.pdf_state.page_index + 1,

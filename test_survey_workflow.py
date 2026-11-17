@@ -11,6 +11,27 @@ from survey_ui import SurveyWorkflow, SurveyRow
 
 
 class SurveyWorkflowTests(unittest.TestCase):
+    def test_region_selection_stays_on_current_page_and_cancels_pending_auto_read(self):
+        ui=SimpleNamespace(copy_busy=False,pdf_state=app.PdfRenderState(path=Path('/survey.pdf'),page_index=2,page_count=3),
+            survey_regions={'header':(0,(.1,.1,.5,.2))},cancel_survey_read=Mock(),
+            survey_auto_pending=True,survey_drag=('header',(.1,.1),(.2,.2)),
+            survey_status=Mock(),pdf_canvas=Mock(),draw_survey_regions=Mock(),render_pdf_page=Mock())
+        SurveyWorkflow.choose_survey_region(ui,'header')
+        self.assertEqual(ui.pdf_state.page_index,2)
+        ui.render_pdf_page.assert_not_called()
+        self.assertEqual(ui.survey_edit_target,'header')
+        self.assertIsNone(ui.survey_drag)
+        self.assertFalse(ui.survey_auto_pending)
+
+    def test_page_change_discards_drag_but_preserves_region_and_selection_mode(self):
+        regions={'lots':(0,(.1,.2,.4,.6))}
+        ui=SimpleNamespace(survey_drag=('lots',(.1,.2),(.4,.6)),survey_edit_target='lots',
+            survey_regions=regions,survey_status=Mock())
+        SurveyWorkflow.prepare_survey_page_change(ui)
+        self.assertIsNone(ui.survey_drag)
+        self.assertEqual(ui.survey_edit_target,'lots')
+        self.assertEqual(ui.survey_regions,regions)
+
     def finish_ui(self):
         ui=SimpleNamespace(copy_source=Path('/source/example.pdf'),survey_batch_context='a'*64,
             survey_ledger={},survey_batches={'a'*64:{}},defer_state_save=False,

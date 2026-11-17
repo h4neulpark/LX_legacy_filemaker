@@ -3,6 +3,7 @@ import sys
 import tempfile
 import time
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import app
@@ -75,6 +76,53 @@ class SurveyGuiTests(unittest.TestCase):
         self.assertFalse(self.root.survey_reading)
         self.assertIsNone(self.root.survey_request)
         self.assertEqual(self.root.address_query.get(),'직접 입력한 주소')
+
+    def test_choose_lot_region_on_third_page_and_copy_whole_document(self):
+        import pymupdf
+        source=self.source_folder/'multipage.pdf'
+        make_fixture(source,split_pages=True)
+        self.root.refresh_source_list(load_state=False)
+        self.root.select_source_file_in_list(source)
+        self.root.select_source_pdf()
+        self.wait(lambda:self.root.rendered_page_index==0 and not self.root.survey_reading)
+        for index in (1,2):
+            self.root.next_page()
+            self.wait(lambda:self.root.rendered_page_index==index)
+        original=self.root.survey_regions['lots']
+        self.root.choose_survey_region('lots')
+        self.assertEqual(self.root.pdf_state.page_index,2,'Choosing a region must keep the current page')
+
+        def pointer(x,y):
+            page=self.root.region_page()
+            canvas=self.root.pdf_canvas
+            return SimpleNamespace(x=10+x*page.rect.width*self.root.render_zoom-canvas.canvasx(0),
+                                   y=10+y*page.rect.height*self.root.render_zoom-canvas.canvasy(0))
+
+        self.root.survey_region_start(pointer(.05,.20))
+        self.root.previous_page()
+        self.wait(lambda:self.root.rendered_page_index==1)
+        self.root.survey_region_end(pointer(.4,.65))
+        self.assertEqual(self.root.survey_regions['lots'],original,'A drag cannot span pages')
+        self.assertEqual(self.root.survey_edit_target,'lots')
+        self.root.next_page()
+        self.wait(lambda:self.root.rendered_page_index==2)
+        self.root.survey_region_start(pointer(.05,.20))
+        self.root.survey_region_end(pointer(.4,.65))
+        self.wait(lambda:not self.root.survey_reading and len(self.root.survey_rows)==3)
+        self.assertEqual(self.root.survey_regions['header'][0],0)
+        self.assertEqual(self.root.survey_regions['lots'][0],2)
+        restored=SimpleNamespace()
+        app.SurveyWorkflow.restore_survey_state(restored,self.root.export_survey_state())
+        self.assertEqual(restored.survey_regions,self.root.survey_regions)
+        self.root.survey_reviewed.set(True)
+        self.root.copy_button.invoke()
+        self.wait(lambda:not self.root.copy_busy)
+        copies=list(self.output.glob('*.pdf'))
+        self.assertEqual(len(copies),3)
+        for copy in copies:
+            self.assertEqual(file_digest(copy),file_digest(source))
+            with pymupdf.open(copy) as doc:
+                self.assertEqual(len(doc),3)
 
     def test_next_file_reads_even_when_render_is_already_cached(self):
         second=self.source_folder/'002.pdf'

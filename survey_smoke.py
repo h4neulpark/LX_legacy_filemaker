@@ -14,12 +14,15 @@ def write_report(path, data):
     temporary.replace(path)
 
 
-def make_fixture(path, scanned=False):
+def make_fixture(path, scanned=False, split_pages=False):
     import pymupdf
     with pymupdf.open() as doc:
         page = doc.new_page(width=600, height=800)
         page.insert_text((40, 70), '경기도 수원시 팔달구 지동 301-6번지 외13필',
                          fontname='korea', fontsize=14)
+        if split_pages:
+            doc.new_page(width=600, height=800)
+            page = doc.new_page(width=600, height=800)
         for y, lot, color in ((200,'301-6',(0,0,0)), (240,'301-6',(1,0,0)),
                                (280,'301-37',(0,0,0)), (320,'301-37',(1,0,0)),
                                (360,'301-45',(0,0,0)), (400,'301-45',(1,0,0)),
@@ -27,10 +30,11 @@ def make_fixture(path, scanned=False):
             page.insert_text((50,y), lot, fontsize=13, color=color)
             page.insert_text((300,y), '1234', fontsize=13)
         if scanned:
-            pix = page.get_pixmap(dpi=300)
             with pymupdf.open() as image_doc:
-                target = image_doc.new_page(width=600, height=800)
-                target.insert_image(target.rect, pixmap=pix)
+                for original in doc:
+                    pix = original.get_pixmap(dpi=300)
+                    target = image_doc.new_page(width=600, height=800)
+                    target.insert_image(target.rect, pixmap=pix)
                 image_doc.save(path)
         else:
             doc.save(path)

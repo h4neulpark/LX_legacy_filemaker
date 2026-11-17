@@ -60,6 +60,16 @@ class SurveyOcrTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             read_survey(path,(4,HEADER_REGION[1]),LOT_REGION)
 
+    def test_header_and_lots_on_different_pages(self):
+        for scanned in (False, True):
+            with self.subTest(scanned=scanned):
+                path=Path(self.tmp.name)/f'multipage-{scanned}.pdf'
+                make_fixture(path,scanned,split_pages=True)
+                result=read_survey(path,HEADER_REGION,(2,LOT_REGION[1]))
+                self.assertIn('지동',result.header)
+                self.assertEqual([row.lot for row in result.candidates],['301-6','301-37','301-45'])
+                self.assertGreater(result.red_pixels,0)
+
     def test_dark_red_is_removed_even_near_gray_threshold(self):
         import pymupdf
         samples=bytes((0,0,0, 80,50,50, 255,0,0, 180,180,180, 240,240,240))

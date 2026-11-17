@@ -321,14 +321,19 @@ class SurveyWorkflow:
         if self.copy_busy or self.pdf_state.path is None:
             return
         self.cancel_survey_read()
+        self.survey_auto_pending = False
+        self.survey_drag = None
         self.survey_edit_target = target
-        page = self.survey_regions[target][0]
-        if page < self.pdf_state.page_count and page != self.pdf_state.page_index:
-            self.pdf_state = replace(self.pdf_state, page_index=page)
-            self.render_pdf_page()
         label = '토지소재 글씨' if target == 'header' else '면적표의 지번 열만'
-        self.survey_status.set(f'{label} 드래그하세요. 다른 페이지에서도 지정할 수 있습니다. Esc: 취소')
+        self.survey_status.set(f'현재 {self.pdf_state.page_index+1}페이지에서 {label} 드래그하세요. 이전/다음으로 페이지 이동 가능 · Esc: 취소')
+        self.draw_survey_regions()
         self.pdf_canvas.focus_set()
+
+    def prepare_survey_page_change(self):
+        # A drag belongs to its starting page. Keep selection mode, discard its coordinates.
+        self.survey_drag = None
+        if self.survey_edit_target is not None:
+            self.survey_status.set('이동한 페이지에서 영역을 새로 드래그하세요. Esc: 취소')
 
     def survey_pointer(self, event):
         page = self.region_page()
