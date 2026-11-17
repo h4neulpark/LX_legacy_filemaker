@@ -668,6 +668,13 @@ class FileMakerApp(tk.Tk):
             "<Control-KP_Add>": self.shortcut_zoom_in,
             "<Control-KeyPress-0>": self.shortcut_fit_width,
         }
+        if self.tk.call("tk", "windowingsystem") == "win32":
+            # Windows XButton1/XButton2 are Tk buttons 4/5. On X11 these
+            # numbers are wheel events, so keep this mapping Windows-only.
+            shortcut_bindings.update({
+                "<ButtonPress-4>": self.shortcut_copy,
+                "<ButtonPress-5>": self.shortcut_copy,
+            })
         for sequence, handler in shortcut_bindings.items():
             def dispatch(event, action=handler):
                 self.hide_tooltips()
@@ -714,7 +721,7 @@ class FileMakerApp(tk.Tk):
             "로드": "입력된 법정동 코드 파일을 다시 읽고 현재 주소의 검색 결과를 갱신합니다.",
             "출력 폴더": "복사 결과를 저장할 폴더를 선택합니다. 원본 PDF는 그대로 보존합니다.",
             "검색 (Enter)": "주소 입력창에서 Enter: 법정동 검색 후 첫 후보 선택\nAlt+3, ↑/↓로 다른 후보를 선택할 수 있습니다. Ctrl+Enter는 다시 검색하지 않고 현재 선택으로 복사합니다.",
-            "복사 (Ctrl+Enter)": "Ctrl+Enter: 어느 패널에서든 현재 주소·선택한 법정동으로 복사\n주소 수정 후에는 Enter로 검색하세요. 영역 편집 중에는 먼저 Enter로 확정해야 합니다.\n성공은 아래 상태줄에 표시하고, 오류·파일명 충돌은 대화상자로 안내합니다.",
+            "복사 (Ctrl+Enter)": "Ctrl+Enter: 어느 패널에서든 현재 주소·선택한 법정동으로 복사\nWindows에서는 마우스 뒤로/앞으로 버튼(XButton1/2)으로도 복사합니다.\n주소 수정 후에는 Enter로 검색하세요. 영역 편집 중에는 먼저 Enter로 확정해야 합니다.\n성공은 아래 상태줄에 표시하고, 오류·파일명 충돌은 대화상자로 안내합니다.",
             "복사 후 다음 미처리 파일로 이동": "켜면 복사 성공 후 다음 미처리 PDF를 열고 같은 영역을 자동 추출합니다.\n목록 끝에서는 앞쪽의 미처리 파일을 찾습니다. 모두 처리했으면 현재 파일에 머뭅니다.\n끄면 현재 파일을 유지합니다. 이 옵션은 이번 실행 동안만 유지됩니다.",
             "출력 목록 새로고침": "출력 폴더 목록을 다시 읽습니다. F5는 원본·출력 목록을 함께 갱신합니다.",
         }

@@ -42,6 +42,38 @@ class KeyboardWorkflowTests(unittest.TestCase):
             self.assertEqual(copy.call_count, len(widgets))
             search.assert_not_called()
 
+    def test_windows_side_buttons_copy_once_and_respect_guards(self):
+        if self.root.tk.call('tk', 'windowingsystem') != 'win32':
+            self.skipTest('Windows XButton mapping')
+        widgets = [self.root.source_list, self.root.address_entry,
+                   self.root.suggestion_list, self.root.output_list, self.root.pdf_canvas]
+        with patch.object(self.root, 'copy_file') as copy, \
+             patch.object(self.root, 'refresh_suggestions') as search:
+            for widget in widgets:
+                self.focus(widget)
+                for button in (4, 5):
+                    with self.subTest(widget=str(widget), button=button):
+                        copy.reset_mock()
+                        widget.event_generate(f'<ButtonPress-{button}>')
+                        widget.event_generate(f'<ButtonRelease-{button}>')
+                        self.root.update()
+                        copy.assert_called_once_with()
+            search.assert_not_called()
+            copy.reset_mock()
+            for attribute, busy in (('ocr_job', object()),
+                                    ('region_keyboard_edit', True),
+                                    ('region_drag', {'mode': 'move'})):
+                original = getattr(self.root, attribute)
+                try:
+                    setattr(self.root, attribute, busy)
+                    for button in (4, 5):
+                        self.root.pdf_canvas.event_generate(f'<ButtonPress-{button}>')
+                        self.root.pdf_canvas.event_generate(f'<ButtonRelease-{button}>')
+                        self.root.update()
+                finally:
+                    setattr(self.root, attribute, original)
+            copy.assert_not_called()
+
     def test_address_shift_arrows_select_text(self):
         self.focus(self.root.address_entry)
         self.root.address_query.set('example address')

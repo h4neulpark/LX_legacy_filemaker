@@ -108,6 +108,7 @@ PNU는 다음 19자리 형식입니다.
 | `Alt+5` | 주소 영역 키보드 편집 |
 | `Enter` | 주소 검색 또는 현재 목록 항목 선택 |
 | `Ctrl+Enter` | 어느 패널에서든 현재 선택으로 파일 복사 (영역 편집은 먼저 확정) |
+| 마우스 뒤로 / 앞으로 (`XButton1` / `XButton2`, Windows) | 두 버튼 모두 `Ctrl+Enter`와 동일하게 파일 복사 |
 | `Ctrl+PageUp` / `Ctrl+PageDown` | 이전/다음 PDF 파일 |
 | `Ctrl+R` | 영역 다시 읽기 |
 | `F8` | 현재 영역을 OCR로 다시 읽기 |
@@ -120,6 +121,11 @@ PNU는 다음 19자리 형식입니다.
 | 뷰어에서 편집 중이 아닐 때 `방향키` | PDF 화면 이동 |
 | 주소 입력 중 `Shift+방향키` | 텍스트 선택 |
 | `F5` | 목록 새로고침 |
+
+Windows에서는 앱 내부에 마우스 포인터를 둔 상태로 뒤로/앞으로 버튼을 누르면 복사합니다.
+Logitech MX Master 3S도 기본 뒤로/앞으로 입력을 사용하면 별도 매핑 프로그램이나 인터넷 연결이 필요하지 않습니다.
+OCR 인식 중이거나 영역 편집 중이면 `Ctrl+Enter`와 동일하게 복사를 보류합니다.
+복사 성공 후에는 ‘복사 후 다음 미처리 파일로 이동’ 옵션을 따릅니다.
 
 ## 개발 실행
 
@@ -176,6 +182,25 @@ PyInstaller로 onefile/windowed exe를 생성합니다.
 ```
 
 빌드 결과는 기본적으로 `dist/법정동PNU파일복사도구.exe`에 생성됩니다.
+
+### Mac에서 GitHub Actions로 Windows exe 빌드
+
+`.github/workflows/build-windows.yml`은 GitHub의 Windows 2022 x64 환경에서
+Python 3.13 x64로 테스트와 빌드를 실행합니다. Mac에 Windows를 설치할 필요가 없습니다.
+
+1. 단축키 수정과 워크플로 파일을 커밋하고 GitHub의 `main` 브랜치에 push합니다.
+2. 저장소의 **Actions → Build Windows EXE**에서 실행 결과를 엽니다.
+3. 성공한 실행 화면 아래 **Artifacts → filemaker-windows-amd64**를 다운로드합니다.
+4. ZIP을 풀고 `법정동PNU파일복사도구.exe`를 오프라인 Windows amd64 PC로 옮깁니다.
+
+`main`에 push할 때마다 자동 빌드합니다. 워크플로가 기본 브랜치에 등록된 후에는
+**Actions → Build Windows EXE → Run workflow**로 수동 빌드할 수도 있습니다.
+결과물 보관 기간은 30일이며, 별도 토큰이나 Secrets 설정은 필요하지 않습니다.
+코드 자료와 OCR 모델도 exe에 포함되어 대상 PC에는 Python이나 인터넷 연결이 필요하지 않습니다.
+
+자동 검사는 GUI 없이 실행 가능한 파일·주소 처리, PDF 영역 좌표·텍스트 추출,
+OCR 모델 무결성 및 오류 처리 테스트를 대상으로 합니다.
+마우스 버튼과 GUI 동작은 대상 Windows PC에서 별도로 확인합니다.
 
 ## 상세 설계
 
