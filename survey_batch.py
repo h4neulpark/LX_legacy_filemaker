@@ -4,6 +4,8 @@ import hashlib
 import json
 from pathlib import Path
 
+from pdf_hash import file_digest
+
 
 @dataclass(frozen=True)
 class BatchItem:
@@ -33,14 +35,6 @@ class BatchResult:
         return (bool(self.outcomes) and not self.error
                 and (not self.expected or len(self.outcomes) == self.expected)
                 and all(o.status in ('copied', 'skipped') for o in self.outcomes))
-
-
-def file_digest(path):
-    digest = hashlib.sha256()
-    with open(path, 'rb') as stream:
-        for block in iter(lambda: stream.read(1024*1024), b''):
-            digest.update(block)
-    return digest.hexdigest()
 
 
 def batch_context(source_identity, code, year, output):

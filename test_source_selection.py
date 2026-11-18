@@ -1,13 +1,17 @@
 """Selection regressions, with desktop event checks on Windows."""
+import hashlib
 import sys
 import tempfile
 import tkinter as tk
 import unittest
 from pathlib import Path
+from threading import Event
 from types import MethodType, SimpleNamespace
 from unittest.mock import Mock
 
 import app
+from pdf_hash import checked_pdf_digest, matching_pdf_paths
+from pdf_pipeline import file_identity
 from workspace_index import SourceIndex
 
 
@@ -52,7 +56,7 @@ class SourceSelectionTests(unittest.TestCase):
             address_query=Mock(), current_suggestions=[], suggestion_list=Mock(),
             selected_dong=None, selected_info=Mock(), update_preview=Mock(),
             clear_pdf_viewer=Mock(), refresh_output_list=Mock(),
-            performance=Mock(),
+            performance=Mock(), operation_status=Mock(),
             source_path_at_pointer=Mock(return_value=self.files[2]),
         )
         self.ui.source_file.get.return_value = str(self.files[5])
@@ -62,6 +66,7 @@ class SourceSelectionTests(unittest.TestCase):
                      'on_source_mouse_press', 'on_source_mouse_release',
                      'on_source_list_select', 'refresh_source_list',
                      'update_source_counts', 'update_processed_source_row',
+                     'mark_source_processed', 'complete_source_without_copy',
                      'shortcut_refresh_lists'):
             setattr(self.ui, name, MethodType(getattr(app.FileMakerApp, name), self.ui))
 
@@ -129,6 +134,31 @@ class SourceSelectionTests(unittest.TestCase):
         self.assertEqual(self.rows[4], self.files[4].name)
         self.listbox.yview_moveto.assert_called_with(.3)
         self.listbox.see.assert_not_called()
+
+    def test_manual_completion_marks_only_the_open_pdf_and_saves_state(self):
+        self.selected[:] = [2]
+        self.ui.complete_source_without_copy()
+        self.assertEqual(self.ui.processed_sources, {self.files[5].resolve()})
+        self.assertEqual(self.rows[5], f'[완료] {self.files[5].name}')
+        self.assertEqual(self.rows[2], self.files[2].name)
+        self.assertEqual(self.selected, [5])
+        self.ui.auto_save_work_state.assert_called_once()
+        self.ui.load_pdf.assert_not_called()
+
+    def test_duplicate_lookup_compares_bytes_and_excludes_the_open_pdf(self):
+        source, duplicate, different, missing = self.files[:4]
+        different.write_bytes(b'pdf')
+        missing.unlink()
+        cancel = Event()
+        identity = file_identity(source)
+        self.assertEqual(checked_pdf_digest(source, identity, cancel), hashlib.sha256(b'PDF').hexdigest())
+        self.assertEqual(
+            matching_pdf_paths(source, identity, [source, duplicate, different, missing], cancel),
+            ([duplicate], 1),
+        )
+        source.write_bytes(b'changed PDF')
+        with self.assertRaises(OSError):
+            matching_pdf_paths(source, identity, [duplicate], cancel)
 
 
 @unittest.skipUnless(sys.platform == 'win32', 'Windows Tk event regression checks')

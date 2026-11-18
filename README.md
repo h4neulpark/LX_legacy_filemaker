@@ -1,4 +1,4 @@
-# 법정동 PNU PDF 정리 도구 v0.7.1_ocr
+# 법정동 PNU PDF 정리 도구 v0.7.2
 
 PDF를 확인하면서 법정동 코드와 지번으로 PNU를 만들고, 선택한 PDF를 규칙화된 파일명으로 출력 폴더에 복사하는 Windows 데스크톱 GUI 도구입니다.
 
@@ -21,6 +21,11 @@ PDF를 확인하면서 법정동 코드와 지번으로 PNU를 만들고, 선택
 현재 파일이 목록에서 사라졌으면 뷰어와 입력을 비워 오래된 PDF로 작업하지 않도록 합니다.
 복사 완료 시에는 완료된 행의 표시와 남은 개수만 갱신합니다.
 외부에서 추가·삭제한 파일은 새로고침 버튼 또는 `F5`로 목록에 반영합니다.
+
+새로고침 위에 현재 PDF의 SHA-256 해시를 표시합니다. **같은 해시 파일 찾기**는
+원본 폴더의 직속 PDF 중 현재 파일과 내용이 같은 다른 파일을 보여 줍니다.
+복사가 필요 없는 원본은 **작업 불필요 · 완료**를 눌러 완료 표시할 수 있습니다.
+현재 PDF를 화면에 유지하며, 완료 표시는 다시 열어도 유지됩니다.
 
 ## v0.7.1_ocr 측량성과도 여러 지번 복사
 
@@ -105,7 +110,7 @@ PDF를 확인하면서 법정동 코드와 지번으로 PNU를 만들고, 선택
 성능 JSON에는 파일명이나 주소 대신 구간별 시간과 표본 수만 저장합니다.
 
 ```powershell
-& '.\법정동PNU파일복사도구_v0.7.1_ocr.exe' --performance-report '.\performance.json'
+& '.\법정동PNU파일복사도구_v0.7.2.exe' --performance-report '.\performance.json'
 ```
 
 ## 화면 구성
@@ -280,7 +285,7 @@ PyInstaller로 onefile/windowed exe를 생성합니다.
 .\.venv\Scripts\python.exe -m PyInstaller --noconfirm --clean '법정동PNU파일복사도구.spec'
 ```
 
-빌드 결과는 기본적으로 `dist/법정동PNU파일복사도구_v0.7.1_ocr.exe`에 생성됩니다.
+빌드 결과는 기본적으로 `dist/법정동PNU파일복사도구_v0.7.2.exe`에 생성됩니다.
 버전은 `version.py`에서 관리하며 창 제목과 exe 이름에 함께 반영됩니다.
 
 ### Mac에서 GitHub Actions로 Windows exe 빌드
@@ -291,7 +296,7 @@ Python 3.13 x64로 테스트와 빌드를 실행합니다. Mac에 Windows를 설
 1. 단축키 수정과 워크플로 파일을 커밋하고 GitHub의 `main` 브랜치에 push합니다.
 2. 저장소의 **Actions → Build Windows EXE**에서 실행 결과를 엽니다.
 3. 성공한 실행 화면 아래 **Artifacts → filemaker-windows-amd64**를 다운로드합니다.
-4. ZIP을 풀고 `법정동PNU파일복사도구_v0.7.1_ocr.exe`를 오프라인 Windows amd64 PC로 옮깁니다.
+4. ZIP을 풀고 `법정동PNU파일복사도구_v0.7.2.exe`를 오프라인 Windows amd64 PC로 옮깁니다.
 
 `main`에 push할 때마다 자동 빌드합니다. 워크플로가 기본 브랜치에 등록된 후에는
 **Actions → Build Windows EXE → Run workflow**로 수동 빌드할 수도 있습니다.

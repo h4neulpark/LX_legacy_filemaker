@@ -18,11 +18,13 @@ import tkinter as tk
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace, field
 from pathlib import Path
+from threading import Event
 from tkinter import filedialog, messagebox, ttk
 
 from tooltips import Tooltip
 from version import APP_VERSION
 from workspace_index import SourceIndex, OutputIndex
+from pdf_hash import checked_pdf_digest, matching_pdf_paths
 from survey_ui import SurveyWorkflow
 from pdf_pipeline import PdfPipeline, PreparedOcrJob, TimingStats, file_identity, render_key, region_key
 
@@ -459,6 +461,10 @@ class FileMakerApp(SurveyWorkflow, tk.Tk):
         self.source_pdf_files: list[Path] = []
         self.source_index = SourceIndex([], set())
         self.source_mouse_path = None
+        self.hash_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="pdf-hash")
+        self.hash_cancel = Event()
+        self.hash_poll_id = None
+        self.hash_results = None
         self.output_files: list[Path] = []
         self.output_index = OutputIndex([])
         self.output_index_folder = None
@@ -511,6 +517,7 @@ class FileMakerApp(SurveyWorkflow, tk.Tk):
         self.pdf_status = tk.StringVar(value="원본 PDF를 선택하세요.")
         self.region_status = tk.StringVar(value="주소 부분을 왼쪽 버튼으로 드래그하세요. (텍스트 PDF)")
         self.source_count_text = tk.StringVar(value="전체 PDF 0개 · 남은 0개")
+        self.source_hash_text = tk.StringVar()
         self.address_query = tk.StringVar()
         self.selected_info = tk.StringVar(value="선택된 법정동이 없습니다.")
         self.pnu_preview = tk.StringVar(value="-")
@@ -609,7 +616,16 @@ class FileMakerApp(SurveyWorkflow, tk.Tk):
         self.source_list.configure(yscrollcommand=scrollbar.set)
 
         ttk.Label(parent, textvariable=self.source_count_text).grid(row=4, column=0, sticky=tk.W, pady=(6, 0))
-        ttk.Button(parent, text="새로고침", command=self.refresh_source_list).grid(row=5, column=0, sticky=tk.EW, pady=(8, 0))
+        ttk.Label(parent, text="PDF SHA-256").grid(row=5, column=0, sticky=tk.W, pady=(8, 0))
+        ttk.Label(parent, textvariable=self.source_hash_text, font="TkFixedFont").grid(
+            row=6, column=0, sticky=tk.W)
+        self.source_hash_text.set("—")
+        self.hash_match_button = ttk.Button(parent, text="같은 해시 파일 찾기", command=self.find_matching_pdfs)
+        self.hash_match_button.state(["disabled"])
+        self.hash_match_button.grid(row=7, column=0, sticky=tk.EW, pady=(6, 0))
+        ttk.Button(parent, text="작업 불필요 · 완료", command=self.complete_source_without_copy).grid(
+            row=8, column=0, sticky=tk.EW, pady=(4, 0))
+        ttk.Button(parent, text="새로고침", command=self.refresh_source_list).grid(row=9, column=0, sticky=tk.EW, pady=(4, 0))
 
     def _build_pdf_panel(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(0, weight=1)
@@ -1227,7 +1243,110 @@ class FileMakerApp(SurveyWorkflow, tk.Tk):
         if not self.source_pdf_files:
             self.source_file.set("")
             self.clear_pdf_viewer("선택한 폴더에 PDF가 없습니다.")
+        elif getattr(self, 'loaded_file_identity', None) and self.current_pdf_doc is not None:
+            self.start_source_hash()
         self.performance.record('source_refresh', time.perf_counter() - started)
+
+    def reset_source_hash(self):
+        self.hash_cancel.set()
+        if self.hash_poll_id is not None:
+            self.after_cancel(self.hash_poll_id)
+            self.hash_poll_id = None
+        if self.hash_results is not None:
+            self.hash_results.destroy()
+            self.hash_results = None
+        self.source_hash_text.set("—")
+        self.hash_match_button.configure(text="같은 해시 파일 찾기")
+        self.hash_match_button.state(["disabled"])
+
+    def start_source_hash(self):
+        self.reset_source_hash()
+        self.hash_cancel = Event()
+        self.source_hash_text.set("계산 중…")
+        future = self.hash_executor.submit(
+            checked_pdf_digest, self.pdf_state.path, self.loaded_file_identity, self.hash_cancel)
+        self.hash_poll_id = self.after(40, self.poll_source_hash, future, False)
+
+    def find_matching_pdfs(self):
+        if self.copy_busy or self.hash_match_button.instate(["disabled"]):
+            return
+        if self.hash_results is not None:
+            self.hash_results.destroy()
+            self.hash_results = None
+        self.hash_match_button.state(["disabled"])
+        self.hash_match_button.configure(text="같은 해시 검색 중…")
+        future = self.hash_executor.submit(
+            matching_pdf_paths, self.pdf_state.path, self.loaded_file_identity,
+            tuple(self.source_pdf_files), self.hash_cancel)
+        self.hash_poll_id = self.after(40, self.poll_source_hash, future, True)
+
+    def poll_source_hash(self, future, searching):
+        if not future.done() or self.copy_busy:
+            self.hash_poll_id = self.after(40, self.poll_source_hash, future, searching)
+            return
+        self.hash_poll_id = None
+        self.hash_match_button.configure(text="같은 해시 파일 찾기")
+        try:
+            result = future.result()
+        except OSError:
+            self.source_hash_text.set("읽기 실패")
+            self.operation_status.set("PDF 해시를 읽지 못했습니다. 파일을 다시 열어 주세요.")
+            return
+        self.hash_match_button.state(["!disabled"])
+        if searching:
+            self.show_matching_pdfs(*result)
+        else:
+            self.source_hash_text.set("\n".join(result[i:i + 16] for i in range(0, len(result), 16)))
+
+    def show_matching_pdfs(self, matches, unreadable):
+        results = self.hash_results = tk.Toplevel(self)
+        results.title("같은 해시 파일")
+        results.transient(self)
+        results.geometry("480x260")
+        results.minsize(300, 160)
+        results.columnconfigure(0, weight=1)
+        results.rowconfigure(1, weight=1)
+        summary = f"현재 PDF와 일치하는 다른 파일 {len(matches):,}개"
+        if unreadable:
+            summary += f" · 확인 실패 {unreadable:,}개"
+        ttk.Label(results, text=summary).grid(row=0, column=0, columnspan=2, sticky=tk.W, padx=10, pady=10)
+        files = tk.Listbox(results, exportselection=False)
+        files.grid(row=1, column=0, sticky=tk.NSEW, padx=(10, 0), pady=(0, 10))
+        vertical = ttk.Scrollbar(results, orient=tk.VERTICAL, command=files.yview)
+        vertical.grid(row=1, column=1, sticky=tk.NS, padx=(0, 10), pady=(0, 10))
+        horizontal = ttk.Scrollbar(results, orient=tk.HORIZONTAL, command=files.xview)
+        horizontal.grid(row=2, column=0, sticky=tk.EW, padx=(10, 0), pady=(0, 10))
+        files.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
+        files.insert(tk.END, *(path.name for path in matches))
+
+        def close():
+            self.hash_results = None
+            results.destroy()
+
+        def open_match(_event):
+            selection = files.curselection()
+            if selection and not self.copy_busy and self.select_source_file_in_list(matches[selection[0]]):
+                close()
+                self.select_source_pdf()
+                self.source_list.focus_set()
+
+        results.protocol("WM_DELETE_WINDOW", close)
+        results.bind("<Escape>", lambda _event: close())
+        files.bind("<Double-Button-1>", open_match)
+        files.bind("<Return>", open_match)
+
+    def complete_source_without_copy(self):
+        if self.copy_busy:
+            return
+        selected = self.source_file.get()
+        if not selected or self.source_index.index(Path(selected)) is None:
+            self.operation_status.set("완료 표시할 원본 PDF를 먼저 여세요.")
+            return
+        source = Path(selected)
+        self.mark_source_processed(source)
+        self.update_processed_source_row(source)
+        self.auto_save_work_state()
+        self.operation_status.set(f"작업 불필요로 완료 표시 · {source.name}")
 
     def update_source_counts(self) -> None:
         total = len(self.source_pdf_files)
@@ -1400,6 +1519,7 @@ class FileMakerApp(SurveyWorkflow, tk.Tk):
         self.pdf_status.set(message)
 
     def close_pdf_doc(self) -> None:
+        self.reset_source_hash()
         self.cancel_ocr()
         self.load_generation += 1
         self.render_request = None
@@ -1450,6 +1570,7 @@ class FileMakerApp(SurveyWorkflow, tk.Tk):
                       else self.address_region.page_index if self.address_region else 0)
             page_index = target if target < page_count else 0
             self.pdf_state = PdfRenderState(path=path, page_index=page_index, page_count=page_count, zoom=1.0, fit_to_width=True)
+            self.start_source_hash()
             self.rendered_page_index = None
             self.current_pdf_image = None
             self.pdf_canvas.delete('all')
@@ -1931,6 +2052,7 @@ class FileMakerApp(SurveyWorkflow, tk.Tk):
             self.operation_status.set("복사 완료 후 앱을 종료합니다…")
             return
         self.close_pdf_doc()
+        self.hash_executor.shutdown(wait=False, cancel_futures=True)
         self.cancel_survey_read()
         for attribute in ('pipeline_poll_id', 'resize_after_id', 'prefetch_after_id', 'pane_layout_id'):
             pending = getattr(self, attribute)
