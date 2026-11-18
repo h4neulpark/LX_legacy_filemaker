@@ -1,16 +1,17 @@
 """Selection regressions, with desktop event checks on Windows."""
 import hashlib
+import os
 import sys
 import tempfile
 import tkinter as tk
 import unittest
+from concurrent.futures import Future
 from pathlib import Path
-from threading import Event
 from types import MethodType, SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import app
-from pdf_hash import checked_pdf_digest, matching_pdf_paths
+from pdf_hash import PdfHashScanner
 from pdf_pipeline import file_identity
 from workspace_index import SourceIndex
 
@@ -149,16 +150,50 @@ class SourceSelectionTests(unittest.TestCase):
         source, duplicate, different, missing = self.files[:4]
         different.write_bytes(b'pdf')
         missing.unlink()
-        cancel = Event()
+        scanner = PdfHashScanner(workers=2)
+        scanner.cold_parallel_bytes = 0
+        self.addCleanup(scanner.close, wait=True)
         identity = file_identity(source)
-        self.assertEqual(checked_pdf_digest(source, identity, cancel), hashlib.sha256(b'PDF').hexdigest())
-        self.assertEqual(
-            matching_pdf_paths(source, identity, [source, duplicate, different, missing], cancel),
-            ([duplicate], 1),
-        )
+        digest = Future()
+        paths = [source, duplicate, different, missing]
+        self.assertEqual(scanner.submit(source, identity, paths, digest).result(15), ([duplicate], 1))
+        self.assertIsNotNone(scanner.pool)
+        self.assertEqual(digest.result(), hashlib.sha256(b'PDF').hexdigest())
+        with patch.object(scanner, '_compute', return_value=iter(())) as compute:
+            self.assertEqual(scanner.submit(source, identity, paths, Future()).result(15), ([duplicate], 1))
+            self.assertEqual(compute.call_args.args[0], {})
+        original = duplicate.stat()
+        replacement = self.folder / 'replacement.pdf'
+        replacement.write_bytes(b'new')
+        os.utime(replacement, ns=(original.st_atime_ns, original.st_mtime_ns))
+        replacement.replace(duplicate)
+        self.assertEqual(scanner.submit(source, identity, paths, Future()).result(15), ([], 1))
         source.write_bytes(b'changed PDF')
         with self.assertRaises(OSError):
-            matching_pdf_paths(source, identity, [duplicate], cancel)
+            scanner.submit(source, identity, paths, Future()).result(15)
+
+    def test_stale_hash_result_does_not_change_the_current_alert(self):
+        old = Future()
+        old.set_result(([self.files[0]], 0))
+        current = Future()
+        ui = SimpleNamespace(hash_job=current, hash_notice=Mock(), show_matching_pdfs=Mock())
+        app.FileMakerApp.poll_source_hash(ui, old, Future(), True)
+        ui.hash_notice.pack.assert_not_called()
+        ui.show_matching_pdfs.assert_not_called()
+
+    def test_current_hash_match_shows_the_alert_without_opening_a_window(self):
+        job = Future()
+        job.set_result(([self.files[0]], 0))
+        digest = Future()
+        digest.set_result(hashlib.sha256(b'PDF').hexdigest())
+        ui = SimpleNamespace(
+            hash_job=job, copy_busy=False, hash_match_button=Mock(), hash_notice=Mock(),
+            hash_notice_label=Mock(), source_hash_text=Mock(), open_hash_notice=Mock(),
+        )
+        app.FileMakerApp.poll_source_hash(ui, job, digest, False)
+        ui.hash_notice_label.configure.assert_called_once_with(text="같은 해시 파일 1개")
+        ui.hash_notice.pack.assert_called_once()
+        ui.open_hash_notice.assert_not_called()
 
 
 @unittest.skipUnless(sys.platform == 'win32', 'Windows Tk event regression checks')

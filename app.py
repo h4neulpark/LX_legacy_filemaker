@@ -15,16 +15,15 @@ import sys
 import time
 import tempfile
 import tkinter as tk
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace, field
 from pathlib import Path
-from threading import Event
 from tkinter import filedialog, messagebox, ttk
 
 from tooltips import Tooltip
 from version import APP_VERSION
 from workspace_index import SourceIndex, OutputIndex
-from pdf_hash import checked_pdf_digest, matching_pdf_paths
+from pdf_hash import PdfHashScanner
 from survey_ui import SurveyWorkflow
 from pdf_pipeline import PdfPipeline, PreparedOcrJob, TimingStats, file_identity, render_key, region_key
 
@@ -461,8 +460,9 @@ class FileMakerApp(SurveyWorkflow, tk.Tk):
         self.source_pdf_files: list[Path] = []
         self.source_index = SourceIndex([], set())
         self.source_mouse_path = None
-        self.hash_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="pdf-hash")
-        self.hash_cancel = Event()
+        self.hash_scanner = PdfHashScanner()
+        self.hash_job = None
+        self.hash_scan_result = None
         self.hash_poll_id = None
         self.hash_results = None
         self.output_files: list[Path] = []
@@ -604,7 +604,13 @@ class FileMakerApp(SurveyWorkflow, tk.Tk):
         ttk.Entry(folder_row, textvariable=self.source_folder).grid(row=0, column=0, sticky=tk.EW)
         ttk.Button(folder_row, text="폴더", command=self.choose_source_folder).grid(row=0, column=1, padx=(6, 0))
 
-        ttk.Label(parent, text="직속 PDF 목록 (Alt+1)").grid(row=2, column=0, sticky=tk.W, pady=(8, 2))
+        list_heading = ttk.Frame(parent)
+        list_heading.grid(row=2, column=0, sticky=tk.EW, pady=(8, 2))
+        ttk.Label(list_heading, text="직속 PDF 목록 (Alt+1)").pack(anchor=tk.W)
+        self.hash_notice = ttk.Frame(list_heading)
+        self.hash_notice_label = ttk.Label(self.hash_notice, font=("TkDefaultFont", 10, "bold"))
+        self.hash_notice_label.pack(anchor=tk.W)
+        ttk.Button(self.hash_notice, text="일치 파일 보기", command=self.open_hash_notice).pack(fill=tk.X, pady=(3, 0))
         list_frame = ttk.Frame(parent)
         list_frame.grid(row=3, column=0, sticky=tk.NSEW)
         list_frame.columnconfigure(0, weight=1)
@@ -1248,7 +1254,10 @@ class FileMakerApp(SurveyWorkflow, tk.Tk):
         self.performance.record('source_refresh', time.perf_counter() - started)
 
     def reset_source_hash(self):
-        self.hash_cancel.set()
+        self.hash_scanner.cancel()
+        self.hash_job = None
+        self.hash_scan_result = None
+        self.hash_notice.pack_forget()
         if self.hash_poll_id is not None:
             self.after_cancel(self.hash_poll_id)
             self.hash_poll_id = None
@@ -1259,44 +1268,60 @@ class FileMakerApp(SurveyWorkflow, tk.Tk):
         self.hash_match_button.configure(text="같은 해시 파일 찾기")
         self.hash_match_button.state(["disabled"])
 
-    def start_source_hash(self):
+    def start_source_hash(self, show_results=False):
         self.reset_source_hash()
-        self.hash_cancel = Event()
         self.source_hash_text.set("계산 중…")
-        future = self.hash_executor.submit(
-            checked_pdf_digest, self.pdf_state.path, self.loaded_file_identity, self.hash_cancel)
-        self.hash_poll_id = self.after(40, self.poll_source_hash, future, False)
+        self.hash_match_button.configure(text="같은 해시 검색 중…")
+        digest_ready = Future()
+        self.hash_job = self.hash_scanner.submit(
+            self.pdf_state.path, self.loaded_file_identity, self.source_pdf_files, digest_ready)
+        self.hash_poll_id = self.after(40, self.poll_source_hash, self.hash_job, digest_ready, show_results)
 
     def find_matching_pdfs(self):
         if self.copy_busy or self.hash_match_button.instate(["disabled"]):
             return
-        if self.hash_results is not None:
-            self.hash_results.destroy()
-            self.hash_results = None
-        self.hash_match_button.state(["disabled"])
-        self.hash_match_button.configure(text="같은 해시 검색 중…")
-        future = self.hash_executor.submit(
-            matching_pdf_paths, self.pdf_state.path, self.loaded_file_identity,
-            tuple(self.source_pdf_files), self.hash_cancel)
-        self.hash_poll_id = self.after(40, self.poll_source_hash, future, True)
+        self.start_source_hash(show_results=True)
 
-    def poll_source_hash(self, future, searching):
-        if not future.done() or self.copy_busy:
-            self.hash_poll_id = self.after(40, self.poll_source_hash, future, searching)
+    def poll_source_hash(self, job, digest_ready, show_results):
+        if job is not self.hash_job:
+            return
+        if not self.copy_busy and digest_ready is not None and digest_ready.done():
+            digest = digest_ready.result()
+            self.source_hash_text.set("\n".join(digest[i:i + 16] for i in range(0, len(digest), 16)))
+            digest_ready = None
+        if not job.done() or self.copy_busy:
+            self.hash_poll_id = self.after(40, self.poll_source_hash, job, digest_ready, show_results)
             return
         self.hash_poll_id = None
         self.hash_match_button.configure(text="같은 해시 파일 찾기")
+        self.hash_match_button.state(["!disabled"])
         try:
-            result = future.result()
+            self.hash_scan_result = job.result()
         except OSError:
             self.source_hash_text.set("읽기 실패")
             self.operation_status.set("PDF 해시를 읽지 못했습니다. 파일을 다시 열어 주세요.")
             return
-        self.hash_match_button.state(["!disabled"])
-        if searching:
-            self.show_matching_pdfs(*result)
-        else:
-            self.source_hash_text.set("\n".join(result[i:i + 16] for i in range(0, len(result), 16)))
+        except RuntimeError:
+            if digest_ready is not None:
+                self.source_hash_text.set("검색 실패")
+            self.operation_status.set("같은 해시 검색에 실패했습니다. 검색 버튼으로 다시 시도하세요.")
+            return
+        matches, unreadable = self.hash_scan_result
+        if matches:
+            self.hash_notice_label.configure(text=f"같은 해시 파일 {len(matches):,}개")
+            self.hash_notice.pack(fill=tk.X, pady=(4, 4))
+        elif unreadable and not show_results:
+            self.operation_status.set(f"같은 해시 검색 중 PDF {unreadable:,}개를 확인하지 못했습니다.")
+        if show_results:
+            self.open_hash_notice()
+
+    def open_hash_notice(self):
+        if self.copy_busy or self.hash_scan_result is None:
+            return
+        if self.hash_results is not None:
+            self.hash_results.lift()
+            return
+        self.show_matching_pdfs(*self.hash_scan_result)
 
     def show_matching_pdfs(self, matches, unreadable):
         results = self.hash_results = tk.Toplevel(self)
@@ -2052,7 +2077,7 @@ class FileMakerApp(SurveyWorkflow, tk.Tk):
             self.operation_status.set("복사 완료 후 앱을 종료합니다…")
             return
         self.close_pdf_doc()
-        self.hash_executor.shutdown(wait=False, cancel_futures=True)
+        self.hash_scanner.close()
         self.cancel_survey_read()
         for attribute in ('pipeline_poll_id', 'resize_after_id', 'prefetch_after_id', 'pane_layout_id'):
             pending = getattr(self, attribute)

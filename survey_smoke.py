@@ -54,7 +54,12 @@ def run(app_class, output):
         destination.mkdir()
         source = source_folder/'survey.pdf'
         make_fixture(source)
+        duplicate = source_folder/'survey-duplicate.pdf'
+        duplicate.write_bytes(source.read_bytes())
         root = app_class()
+        # Exercise actual spawned hashing in the frozen Windows executable.
+        root.hash_scanner.workers = 2
+        root.hash_scanner.cold_parallel_bytes = 0
         for tooltip in root.tooltips:
             tooltip.delay = 100000
         root.hide_tooltips()
@@ -88,7 +93,10 @@ def run(app_class, output):
                     root.survey_tree.selection_set('0')
                     root.set_zoom(.55)
                     phase='rendering'
-                elif phase=='rendering' and root.rendered_page_index==root.pdf_state.page_index:
+                elif (phase=='rendering' and root.rendered_page_index==root.pdf_state.page_index
+                      and root.hash_scan_result is not None):
+                    assert root.hash_scan_result == ([duplicate], 0)
+                    assert root.hash_notice.winfo_manager() == 'pack'
                     root.hide_tooltips()
                     root.update_idletasks()
                     preview = dict(phase='ready', x=root.winfo_rootx(), y=root.winfo_rooty(),
